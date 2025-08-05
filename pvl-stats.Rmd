@@ -6,6 +6,7 @@ library(Rlabkey)
 library(forecast)
 library(scales)
 library(pracma)
+library(ggplot2)
 
 knitr::opts_chunk$set(echo = TRUE)
 
@@ -13,6 +14,22 @@ Rdiscvr::SetLabKeyDefaults(baseUrl = 'https://prime-seq.ohsu.edu', defaultFolder
 ```
 
 ```{r}
+.AppendSummaryRow <- function(id, date, outcome, numeric_value = NA, string_value = NA, comment = NA, data_source = NA) {
+  if (is.na(numeric_value) && is.na(string_value)) {
+    return(NULL)
+  }
+
+  tibble::tibble(
+    id = id,
+    date = date,
+    outcome = outcome,
+    numericValue = numeric_value,
+    stringValue = string_value,
+    comments = comment,
+    datasource = data_source
+  )
+}
+
 # Compute chronic phase viral load setpoints and plot the trajectory.
 #
 # This function calculates two geometric mean setpoints from 8–16 weeks post-infection:
@@ -28,17 +45,25 @@ Rdiscvr::SetLabKeyDefaults(baseUrl = 'https://prime-seq.ohsu.edu', defaultFolder
 .ChronicPhaseSetpoint <- function(df = NULL, minPoints = 4, minDaysDuration = 7) {
   if (is.null(df) || nrow(df) == 0) {
     warning("Input dataframe is NULL or empty")
-    return(df)
+    return(list(df = df, summary = tibble()))
   }
 
   df <- df %>%
     mutate(
       log10_pvl = log10(result),
-      postArt = ifelse(!is.na(artinformation_dayspostartinitiation), TRUE, FALSE)
+      postArt = ifelse(!is.na(artinformation_dayspostartinitiation), TRUE, FALSE),
+      art_initiation_dpi = as.numeric(artinformation_artinitiation - timepostsivchallenge_infectiondate),
+      art_release_dpi = as.numeric(artinformation_artrelease - timepostsivchallenge_infectiondate)
     )
 
   chronic_df <- df %>%
     filter(timepostsivchallenge_dayspostinfection >= 56, timepostsivchallenge_dayspostinfection <= 112)
+
+  id <- unique(df$id)
+  date <- min(df$date, na.rm = TRUE)
+  data_source <- df$datasource[1]
+
+  summary_outcomes <- list()
 
   # Pre-ART Setpoint
   pre_art_df <- chronic_df %>% filter(postArt == FALSE)
@@ -46,9 +71,10 @@ Rdiscvr::SetLabKeyDefaults(baseUrl = 'https://prime-seq.ohsu.edu', defaultFolder
       (max(pre_art_df$timepostsivchallenge_dayspostinfection) - min(pre_art_df$timepostsivchallenge_dayspostinfection)) >= minDaysDuration) {
     setpoint <- exp(mean(log(pre_art_df$result)))
     pacf_val <- pacf(log10(pre_art_df$result), plot = FALSE)$acf[1]
-  } else {
-    setpoint <- NA
-    pacf_val <- NA
+    summary_outcomes <- append(summary_outcomes, list(
+      .AppendSummaryRow(id, date, "preArtSetpoint", numeric_value = setpoint, data_source = data_source),
+      .AppendSummaryRow(id, date, "preArtSetpointPACF", numeric_value = pacf_val, data_source = data_source)
+    ))
   }
 
   # Post-ART (ATI) Setpoint
@@ -56,52 +82,43 @@ Rdiscvr::SetLabKeyDefaults(baseUrl = 'https://prime-seq.ohsu.edu', defaultFolder
   if (nrow(post_art_df) >= minPoints &&
       (max(post_art_df$timepostsivchallenge_dayspostinfection) - min(post_art_df$timepostsivchallenge_dayspostinfection)) >= minDaysDuration) {
     ati_setpoint <- exp(mean(log(post_art_df$result)))
-  } else {
-    ati_setpoint <- NA
+    summary_outcomes <- append(summary_outcomes, list(
+      .AppendSummaryRow(id, date, "atiSetpoint", numeric_value = ati_setpoint, data_source = data_source)
+    ))
   }
 
-  df$Setpoint <- setpoint
-  df$ATI_Setpoint <- ati_setpoint
-  df$Setpoint_PACF <- pacf_val
-
-  df <- df %>%
-    mutate(
-      art_initiation_dpi = as.numeric(artinformation_artinitiation - timepostsivchallenge_infectiondate),
-      art_release_dpi = as.numeric(artinformation_artrelease - timepostsivchallenge_infectiondate)
-    )
-
   y_label_pos <- min(df$result[df$result > 0], na.rm = TRUE) * 1.5
-  
+
   gg <- ggplot(df, aes(x = timepostsivchallenge_dayspostinfection, y = result)) +
     geom_line(aes(group = id), color = "grey60") +
     geom_point(color = "grey70", size = 2) +
     scale_y_log10(labels = trans_format("log10", math_format(10^.x))) +
-    geom_vline(data = df %>% filter(!is.na(art_initiation_dpi)), 
+    geom_vline(data = df %>% filter(!is.na(art_initiation_dpi)),
                aes(xintercept = art_initiation_dpi), linetype = "dashed", color = "blue") +
-    geom_vline(data = df %>% filter(!is.na(art_release_dpi)), 
+    geom_vline(data = df %>% filter(!is.na(art_release_dpi)),
                aes(xintercept = art_release_dpi), linetype = "dashed", color = "red") +
     geom_vline(xintercept = 56, linetype = "dotted", color = "darkgreen", linewidth = 0.8) +
     geom_vline(xintercept = 112, linetype = "dotted", color = "darkgreen", linewidth = 0.8) +
-    geom_point(data = pre_art_df, 
-               aes(x = timepostsivchallenge_dayspostinfection, y = result), 
+    geom_point(data = pre_art_df,
+               aes(x = timepostsivchallenge_dayspostinfection, y = result),
                shape = 21, fill = "blue", color = "black", size = 3) +
-    geom_point(data = post_art_df, 
-               aes(x = timepostsivchallenge_dayspostinfection, y = result), 
+    geom_point(data = post_art_df,
+               aes(x = timepostsivchallenge_dayspostinfection, y = result),
                shape = 21, fill = "red", color = "black", size = 3) +
     labs(
       title = paste0("Chronic Phase Setpoint data for ", unique(df$id)),
       y = "Plasma Viral Load (copies/mL)",
       x = "Days Post Infection"
     ) +
-    annotate("text", x = 56, y = min(df$result[df$result > 0], na.rm = TRUE), 
+    annotate("text", x = 56, y = min(df$result[df$result > 0], na.rm = TRUE),
              label = "8 weeks", angle = 90, vjust = 1.2, hjust = 0,
              color = "darkgreen", size = 3.5) +
-    annotate("text", x = 112, y = min(df$result[df$result > 0], na.rm = TRUE), 
+    annotate("text", x = 112, y = min(df$result[df$result > 0], na.rm = TRUE),
              label = "16 weeks", angle = 90, vjust = 1.2, hjust = 0,
              color = "darkgreen", size = 3.5) +
     theme_minimal()
 
-  if (!is.na(setpoint)) {
+  if (exists("setpoint") && !is.na(setpoint)) {
     gg <- gg +
       geom_hline(yintercept = setpoint, linetype = "solid", color = "blue", linewidth = 0.4) +
       annotate("text", x = min(df$timepostsivchallenge_dayspostinfection, na.rm = TRUE),
@@ -109,14 +126,14 @@ Rdiscvr::SetLabKeyDefaults(baseUrl = 'https://prime-seq.ohsu.edu', defaultFolder
                color = "blue", size = 3.5)
   }
 
-  if (!is.na(ati_setpoint)) {
+  if (exists("ati_setpoint") && !is.na(ati_setpoint)) {
     gg <- gg +
       geom_hline(yintercept = ati_setpoint, linetype = "solid", color = "red", linewidth = 0.4) +
       annotate("text", x = min(df$timepostsivchallenge_dayspostinfection, na.rm = TRUE),
                y = ati_setpoint, label = "ATI Setpoint", hjust = -0.1, vjust = -0.5,
                color = "red", size = 3.5)
   }
-  
+
   art_initiation_x <- df %>% filter(!is.na(art_initiation_dpi)) %>% distinct(art_initiation_dpi) %>% pull()
   art_release_x <- df %>% filter(!is.na(art_release_dpi)) %>% distinct(art_release_dpi) %>% pull()
 
@@ -132,11 +149,15 @@ Rdiscvr::SetLabKeyDefaults(baseUrl = 'https://prime-seq.ohsu.edu', defaultFolder
                         label = "ART Release", angle = 90, vjust = 1.2, hjust = 0,
                         color = "red", size = 3.5)
   }
-    
+
   print(gg)
 
-  return(df)
+  return(list(
+    df = df,
+    summary = dplyr::bind_rows(summary_outcomes)
+  ))
 }
+
 
 # Identify acute phase peak viral load and plot the trajectory.
 #
@@ -149,7 +170,7 @@ Rdiscvr::SetLabKeyDefaults(baseUrl = 'https://prime-seq.ohsu.edu', defaultFolder
 .AcutePhasePeak <- function(df, window_days = 35) {
   if (is.null(df) || nrow(df) == 0) {
     warning("Input dataframe is NULL or empty")
-    return(df)
+    return(list(df = df, summary = tibble()))
   }
 
   df <- df %>%
@@ -160,6 +181,12 @@ Rdiscvr::SetLabKeyDefaults(baseUrl = 'https://prime-seq.ohsu.edu', defaultFolder
   acute_df <- df %>%
     filter(timepostsivchallenge_dayspostinfection <= window_days)
 
+  id <- unique(df$id)
+  date <- min(df$date, na.rm = TRUE)
+  data_source <- df$datasource[1]
+
+  summary_outcomes <- list()
+
   if (nrow(acute_df) > 0) {
     peak_row <- acute_df %>%
       filter(result == max(result, na.rm = TRUE)) %>%
@@ -169,13 +196,16 @@ Rdiscvr::SetLabKeyDefaults(baseUrl = 'https://prime-seq.ohsu.edu', defaultFolder
     acute_peak_day <- peak_row$timepostsivchallenge_dayspostinfection
     art_before_peak <- !is.na(peak_row$art_initiation_dpi) &&
       peak_row$art_initiation_dpi <= acute_peak_day
+
+    summary_outcomes <- append(summary_outcomes, list(
+      .AppendSummaryRow(id, date, "acutePhasePeak_pVL", numeric_value = acute_peak, data_source = data_source),
+      .AppendSummaryRow(id, date, "acutePhasePeak_day", numeric_value = acute_peak_day, data_source = data_source)
+    ))
+
   } else {
-    acute_peak <- NA
-    acute_peak_day <- NA
     art_before_peak <- NA
   }
 
-  df$AcutePhasePeak_pVL <- acute_peak
   df$AcutePhasePeak_ARTBeforePeak <- art_before_peak
 
   gg <- ggplot(df, aes(x = timepostsivchallenge_dayspostinfection, y = result)) +
@@ -195,7 +225,7 @@ Rdiscvr::SetLabKeyDefaults(baseUrl = 'https://prime-seq.ohsu.edu', defaultFolder
              label = paste0(window_days, "d"), angle = 90, vjust = 1.2, hjust = 0,
              color = "darkgreen", size = 3.5)
 
-  if (!is.na(acute_peak_day)) {
+  if (exists("acute_peak_day") && !is.na(acute_peak_day)) {
     gg <- gg +
       geom_point(data = peak_row, 
                  aes(x = timepostsivchallenge_dayspostinfection, y = result),
@@ -206,8 +236,13 @@ Rdiscvr::SetLabKeyDefaults(baseUrl = 'https://prime-seq.ohsu.edu', defaultFolder
   }
 
   print(gg)
-  return(df)
+
+  return(list(
+    df = df,
+    summary = dplyr::bind_rows(summary_outcomes)
+  ))
 }
+
 
 # Identify and visualize viral blips above LOD during ART.
 #
@@ -221,7 +256,7 @@ Rdiscvr::SetLabKeyDefaults(baseUrl = 'https://prime-seq.ohsu.edu', defaultFolder
 .OnARTBlipFrequency <- function(df) {
   if (is.null(df) || nrow(df) == 0) {
     warning("Input dataframe is NULL or empty")
-    return(df)
+    return(list(df = df, summary = tibble()))
   }
 
   df <- df %>%
@@ -237,6 +272,17 @@ Rdiscvr::SetLabKeyDefaults(baseUrl = 'https://prime-seq.ohsu.edu', defaultFolder
     )
 
   blip_count <- sum(df$OnARTBlip, na.rm = TRUE)
+
+  id <- unique(df$id)
+  date <- min(df$date, na.rm = TRUE)
+  data_source <- df$datasource[1]
+
+  summary_outcomes <- list()
+  if (!is.na(blip_count) && blip_count > 0) {
+    summary_outcomes <- append(summary_outcomes, list(
+      .AppendSummaryRow(id, date, "onArtBlipCount", numeric_value = blip_count, data_source = data_source)
+    ))
+  }
 
   gg <- ggplot(df, aes(x = timepostsivchallenge_dayspostinfection, y = result)) +
     geom_line(aes(group = id), color = "grey60") +
@@ -256,7 +302,6 @@ Rdiscvr::SetLabKeyDefaults(baseUrl = 'https://prime-seq.ohsu.edu', defaultFolder
     ) +
     theme_minimal()
   
-    
   art_initiation_x <- df %>% filter(!is.na(art_initiation_dpi)) %>% distinct(art_initiation_dpi) %>% pull()
   art_release_x <- df %>% filter(!is.na(art_release_dpi)) %>% distinct(art_release_dpi) %>% pull()
 
@@ -274,11 +319,11 @@ Rdiscvr::SetLabKeyDefaults(baseUrl = 'https://prime-seq.ohsu.edu', defaultFolder
   }
   
   lod_vals <- df %>%
-  filter(!is.na(lod), !is.na(art_initiation_dpi), !is.na(art_release_dpi)) %>%
-  filter(timepostsivchallenge_dayspostinfection >= art_initiation_dpi,
-         timepostsivchallenge_dayspostinfection <= art_release_dpi) %>%
-  distinct(lod) %>%
-  pull()
+    filter(!is.na(lod), !is.na(art_initiation_dpi), !is.na(art_release_dpi)) %>%
+    filter(timepostsivchallenge_dayspostinfection >= art_initiation_dpi,
+           timepostsivchallenge_dayspostinfection <= art_release_dpi) %>%
+    distinct(lod) %>%
+    pull()
 
   for (lod_y in lod_vals) {
     gg <- gg +
@@ -294,8 +339,13 @@ Rdiscvr::SetLabKeyDefaults(baseUrl = 'https://prime-seq.ohsu.edu', defaultFolder
   }
 
   print(gg)
-  return(df)
+
+  return(list(
+    df = df,
+    summary = dplyr::bind_rows(summary_outcomes)
+  ))
 }
+
 
 # Compute and visualize time to viral rebound after ART release.
 #
@@ -311,7 +361,7 @@ Rdiscvr::SetLabKeyDefaults(baseUrl = 'https://prime-seq.ohsu.edu', defaultFolder
                            lod_floor = TRUE) {
   if (is.null(df) || nrow(df) == 0) {
     warning("Input dataframe is NULL or empty")
-    return(df)
+    return(list(df = df, summary = tibble()))
   }
 
   df <- df %>%
@@ -323,6 +373,11 @@ Rdiscvr::SetLabKeyDefaults(baseUrl = 'https://prime-seq.ohsu.edu', defaultFolder
       art_release_dpi = as.numeric(artinformation_artrelease - timepostsivchallenge_infectiondate)
     )
 
+  id <- unique(df$id)
+  date <- min(df$date, na.rm = TRUE)
+  data_source <- df$datasource[1]
+  summary_outcomes <- list()
+
   art_timing <- df %>%
     filter(!is.na(art_initiation_date), !is.na(art_release_date)) %>%
     transmute(
@@ -332,10 +387,7 @@ Rdiscvr::SetLabKeyDefaults(baseUrl = 'https://prime-seq.ohsu.edu', defaultFolder
     distinct()
 
   if (nrow(art_timing) == 0 || is.na(art_timing$duration[1]) || art_timing$duration[1] < minARTDuration) {
-    df$TimeToRebound_LOD <- NA
-    df$TimeToRebound_100 <- NA
-    df$TimeToRebound_1000 <- NA
-    return(df)
+    return(list(df = df, summary = tibble()))
   }
 
   art_stop <- art_timing$art_release_dpi[1]
@@ -347,7 +399,6 @@ Rdiscvr::SetLabKeyDefaults(baseUrl = 'https://prime-seq.ohsu.edu', defaultFolder
     df_hit <- df_sub %>%
       filter(result > threshold) %>%
       arrange(dpi)
-  
     if (nrow(df_hit) == 0) return(NA)
     df_hit$dpi[1] - art_stop
   }
@@ -358,9 +409,21 @@ Rdiscvr::SetLabKeyDefaults(baseUrl = 'https://prime-seq.ohsu.edu', defaultFolder
   rebound_100   <- get_rebound_day(post_ati, 100, art_stop)
   rebound_1000  <- get_rebound_day(post_ati, 1000, art_stop)
 
-  df$TimeToRebound_LOD <- rebound_lod
-  df$TimeToRebound_100 <- rebound_100
-  df$TimeToRebound_1000 <- rebound_1000
+  if (!is.na(rebound_lod)) {
+    summary_outcomes <- append(summary_outcomes, list(
+      .AppendSummaryRow(id, date, "timeToRebound_LOD", numeric_value = rebound_lod, data_source = data_source)
+    ))
+  }
+  if (!is.na(rebound_100)) {
+    summary_outcomes <- append(summary_outcomes, list(
+      .AppendSummaryRow(id, date, "timeToRebound_100", numeric_value = rebound_100, data_source = data_source)
+    ))
+  }
+  if (!is.na(rebound_1000)) {
+    summary_outcomes <- append(summary_outcomes, list(
+      .AppendSummaryRow(id, date, "timeToRebound_1000", numeric_value = rebound_1000, data_source = data_source)
+    ))
+  }
 
   get_first_point <- function(threshold) {
     df %>%
@@ -418,8 +481,13 @@ Rdiscvr::SetLabKeyDefaults(baseUrl = 'https://prime-seq.ohsu.edu', defaultFolder
   highlight_point(point_1000, "red")
 
   print(gg)
-  return(df)
+
+  return(list(
+    df = df,
+    summary = dplyr::bind_rows(summary_outcomes)
+  ))
 }
+
 
 # Compute and visualize post-rebound viral setpoint.
 #
@@ -436,7 +504,7 @@ Rdiscvr::SetLabKeyDefaults(baseUrl = 'https://prime-seq.ohsu.edu', defaultFolder
                                  minDaysPostRelease = 14) {
   if (is.null(df) || nrow(df) == 0) {
     warning("Input dataframe is NULL or empty")
-    return(df)
+    return(list(df = df, summary = tibble()))
   }
 
   df <- df %>%
@@ -448,6 +516,11 @@ Rdiscvr::SetLabKeyDefaults(baseUrl = 'https://prime-seq.ohsu.edu', defaultFolder
       art_release_dpi = as.numeric(art_release_date - infection_date)
     )
 
+  id <- unique(df$id)
+  date <- min(df$date, na.rm = TRUE)
+  data_source <- df$datasource[1]
+  summary_outcomes <- list()
+
   art_timing <- df %>%
     filter(!is.na(art_initiation_date), !is.na(art_release_date)) %>%
     transmute(
@@ -457,9 +530,7 @@ Rdiscvr::SetLabKeyDefaults(baseUrl = 'https://prime-seq.ohsu.edu', defaultFolder
     distinct()
 
   if (nrow(art_timing) == 0 || is.na(art_timing$duration[1]) || art_timing$duration[1] < minARTDuration) {
-    df$PostReboundSetpoint <- NA
-    df$PostReboundSetpoint_PACF <- NA
-    return(df)
+    return(list(df = df, summary = tibble()))
   }
 
   art_stop <- art_timing$art_release_dpi[1]
@@ -472,13 +543,12 @@ Rdiscvr::SetLabKeyDefaults(baseUrl = 'https://prime-seq.ohsu.edu', defaultFolder
       (max(post_rebound_df$dpi) - min(post_rebound_df$dpi)) >= minDaysDuration) {
     post_rebound_setpoint <- exp(mean(log(post_rebound_df$result)))
     pacf_val <- pacf(log10(post_rebound_df$result), plot = FALSE)$acf[1]
-  } else {
-    post_rebound_setpoint <- NA
-    pacf_val <- NA
-  }
 
-  df$PostReboundSetpoint <- post_rebound_setpoint
-  df$PostReboundSetpoint_PACF <- pacf_val
+    summary_outcomes <- append(summary_outcomes, list(
+      .AppendSummaryRow(id, date, "postReboundSetpoint", numeric_value = post_rebound_setpoint, data_source = data_source),
+      .AppendSummaryRow(id, date, "postReboundSetpointPACF", numeric_value = pacf_val, data_source = data_source)
+    ))
+  }
 
   y_label_pos <- min(df$result[df$result > 0], na.rm = TRUE) * 1.5
 
@@ -500,7 +570,7 @@ Rdiscvr::SetLabKeyDefaults(baseUrl = 'https://prime-seq.ohsu.edu', defaultFolder
              color = "red", size = 3.5) +
     theme_minimal()
 
-  if (!is.na(post_rebound_setpoint)) {
+  if (exists("post_rebound_setpoint") && !is.na(post_rebound_setpoint)) {
     gg <- gg +
       geom_hline(yintercept = post_rebound_setpoint, linetype = "solid", color = "purple", linewidth = 0.4) +
       annotate("text", x = min(df$dpi, na.rm = TRUE),
@@ -509,8 +579,13 @@ Rdiscvr::SetLabKeyDefaults(baseUrl = 'https://prime-seq.ohsu.edu', defaultFolder
   }
 
   print(gg)
-  return(df)
+
+  return(list(
+    df = df,
+    summary = dplyr::bind_rows(summary_outcomes)
+  ))
 }
+
 
 # Compute and visualize acute phase viral burden (AUC).
 #
@@ -523,7 +598,7 @@ Rdiscvr::SetLabKeyDefaults(baseUrl = 'https://prime-seq.ohsu.edu', defaultFolder
 .AcutePhaseBurden <- function(df, acute_cutoff = 56) {
   if (is.null(df) || nrow(df) == 0) {
     warning("Input dataframe is NULL or empty")
-    return(df)
+    return(list(df = df, summary = tibble()))
   }
 
   df <- df %>%
@@ -535,14 +610,18 @@ Rdiscvr::SetLabKeyDefaults(baseUrl = 'https://prime-seq.ohsu.edu', defaultFolder
     filter(dpi >= 0, dpi <= acute_cutoff) %>%
     arrange(dpi)
 
-  if (nrow(acute_df) < 2) {
-    df$AcutePhaseBurden <- NA
-    return(df)
+  id <- unique(df$id)
+  date <- min(df$date, na.rm = TRUE)
+  data_source <- df$datasource[1]
+  summary_outcomes <- list()
+
+  if (nrow(acute_df) >= 2) {
+    auc <- trapz(acute_df$dpi, acute_df$result)
+
+    summary_outcomes <- append(summary_outcomes, list(
+      .AppendSummaryRow(id, date, "acutePhaseBurden", numeric_value = auc, data_source = data_source)
+    ))
   }
-
-  auc <- trapz(acute_df$dpi, acute_df$result)
-
-  df$AcutePhaseBurden <- auc
 
   gg <- ggplot(df, aes(x = dpi, y = result)) +
     geom_line(aes(group = id), color = "grey60") +
@@ -556,15 +635,20 @@ Rdiscvr::SetLabKeyDefaults(baseUrl = 'https://prime-seq.ohsu.edu', defaultFolder
     scale_y_log10(labels = trans_format("log10", math_format(10^.x))) +
     labs(
       title = paste0("Acute Phase Burden for ", unique(df$id)),
-      subtitle = paste0("AUC (0–", acute_cutoff, " dpi): ", round(auc, 1)),
+      subtitle = if (exists("auc")) paste0("AUC (0–", acute_cutoff, " dpi): ", round(auc, 1)) else NULL,
       y = "Plasma Viral Load (copies/mL)",
       x = "Days Post Infection"
     ) +
     theme_minimal()
 
   print(gg)
-  return(df)
+
+  return(list(
+    df = df,
+    summary = dplyr::bind_rows(summary_outcomes)
+  ))
 }
+
 
 .GetData <- function(id = NULL) {
   if (is.null(id)) {
@@ -583,19 +667,90 @@ Rdiscvr::SetLabKeyDefaults(baseUrl = 'https://prime-seq.ohsu.edu', defaultFolder
     )
 }
 
-Run <- function (id = NULL) {
-  if (is.null(id)) {
-    stop("Please choose an ID for fetching pVL data.")
+Run <- function(ids = NULL) {
+  if (is.null(ids)) {
+    stop("Please provide one or more IDs to process.")
   }
-  
-  df <- .GetData(id) %>%
-    .ChronicPhaseSetpoint %>%
-    .AcutePhasePeak %>%
-    .OnARTBlipFrequency %>%
-    .TimeToRebound %>%
-    .PostReboundSetPoint %>%
-    .AcutePhaseBurden
-  
-  return(df)
+
+  all_summaries <- list()
+
+  for (id in ids) {
+    message("Processing ID: ", id)
+
+    df <- tryCatch({
+      .GetData(id)
+    }, error = function(e) {
+      warning("Failed to fetch data for ID: ", id, ". Skipping.")
+      return(NULL)
+    })
+
+    if (is.null(df) || nrow(df) == 0) {
+      next
+    }
+
+    id_summaries <- list()
+
+    res <- .ChronicPhaseSetpoint(df)
+    df <- res$df
+    id_summaries <- append(id_summaries, list(res$summary))
+
+    res <- .AcutePhasePeak(df)
+    df <- res$df
+    id_summaries <- append(id_summaries, list(res$summary))
+
+    res <- .OnARTBlipFrequency(df)
+    df <- res$df
+    id_summaries <- append(id_summaries, list(res$summary))
+
+    res <- .TimeToRebound(df)
+    df <- res$df
+    id_summaries <- append(id_summaries, list(res$summary))
+
+    res <- .PostReboundSetPoint(df)
+    df <- res$df
+    id_summaries <- append(id_summaries, list(res$summary))
+
+    res <- .AcutePhaseBurden(df)
+    id_summaries <- append(id_summaries, list(res$summary))
+
+    all_summaries <- append(all_summaries, list(dplyr::bind_rows(id_summaries)))
+  }
+
+  combined_summary <- dplyr::bind_rows(all_summaries)
+
+  return(combined_summary)
+}
+
+UploadPVLOutcomes <- function(df) {
+  if (is.null(df) || nrow(df) == 0) {
+    stop("No rows to upload.")
+  }
+
+  required_cols <- c("id", "date", "outcome", "numericValue", "stringValue", "comments", "dataSource")
+  missing_cols <- setdiff(required_cols, names(df))
+  if (length(missing_cols) > 0) {
+    stop("Missing required columns in df: ", paste(missing_cols, collapse = ", "))
+  }
+
+  upload_df <- df %>%
+    dplyr::transmute(
+      Id = id,
+      date = as.character(date),
+      outcome = outcome,
+      numeric_value = numericValue,
+      string_value = stringValue,
+      comments = comments,
+      dataSource = dataSource
+    )
+
+  Rlabkey::labkey.insertRows(
+    baseUrl = "https://prime-seq.ohsu.edu",
+    folderPath = "/Labs/Bimber/Collaborations/SIV_Studies",
+    schemaName = "study",
+    queryName = "pvl_outcomes",
+    toInsert = upload_df
+  )
+
+  message("Uploaded ", nrow(upload_df), " rows to pvl_outcomes.")
 }
 ```
