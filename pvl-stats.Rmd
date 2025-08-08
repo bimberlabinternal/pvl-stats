@@ -7,6 +7,8 @@ library(forecast)
 library(scales)
 library(pracma)
 library(ggplot2)
+library(patchwork)
+library(officer)
 
 knitr::opts_chunk$set(echo = TRUE)
 
@@ -45,7 +47,7 @@ Rdiscvr::SetLabKeyDefaults(baseUrl = 'https://prime-seq.ohsu.edu', defaultFolder
 .ChronicPhaseSetpoint <- function(df = NULL, minPoints = 4, minDaysDuration = 7) {
   if (is.null(df) || nrow(df) == 0) {
     warning("Input dataframe is NULL or empty")
-    return(list(df = df, summary = tibble()))
+    return(list(df = df, summary = tibble(), plot = NULL))
   }
 
   df <- df %>%
@@ -150,11 +152,10 @@ Rdiscvr::SetLabKeyDefaults(baseUrl = 'https://prime-seq.ohsu.edu', defaultFolder
                         color = "red", size = 3.5)
   }
 
-  print(gg)
-
   return(list(
     df = df,
-    summary = dplyr::bind_rows(summary_outcomes)
+    summary = dplyr::bind_rows(summary_outcomes),
+    plot = gg
   ))
 }
 
@@ -170,7 +171,7 @@ Rdiscvr::SetLabKeyDefaults(baseUrl = 'https://prime-seq.ohsu.edu', defaultFolder
 .AcutePhasePeak <- function(df, window_days = 35) {
   if (is.null(df) || nrow(df) == 0) {
     warning("Input dataframe is NULL or empty")
-    return(list(df = df, summary = tibble()))
+    return(list(df = df, summary = tibble(), plot = NULL))
   }
 
   df <- df %>%
@@ -235,11 +236,10 @@ Rdiscvr::SetLabKeyDefaults(baseUrl = 'https://prime-seq.ohsu.edu', defaultFolder
                vjust = -1, hjust = 0.5, size = 3.5)
   }
 
-  print(gg)
-
   return(list(
     df = df,
-    summary = dplyr::bind_rows(summary_outcomes)
+    summary = dplyr::bind_rows(summary_outcomes),
+    plot = gg
   ))
 }
 
@@ -256,7 +256,7 @@ Rdiscvr::SetLabKeyDefaults(baseUrl = 'https://prime-seq.ohsu.edu', defaultFolder
 .OnARTBlipFrequency <- function(df) {
   if (is.null(df) || nrow(df) == 0) {
     warning("Input dataframe is NULL or empty")
-    return(list(df = df, summary = tibble()))
+    return(list(df = df, summary = tibble(), plot = NULL))
   }
 
   df <- df %>%
@@ -338,11 +338,10 @@ Rdiscvr::SetLabKeyDefaults(baseUrl = 'https://prime-seq.ohsu.edu', defaultFolder
                size = 3.5)
   }
 
-  print(gg)
-
   return(list(
     df = df,
-    summary = dplyr::bind_rows(summary_outcomes)
+    summary = dplyr::bind_rows(summary_outcomes),
+    plot = gg
   ))
 }
 
@@ -361,7 +360,7 @@ Rdiscvr::SetLabKeyDefaults(baseUrl = 'https://prime-seq.ohsu.edu', defaultFolder
                            lod_floor = TRUE) {
   if (is.null(df) || nrow(df) == 0) {
     warning("Input dataframe is NULL or empty")
-    return(list(df = df, summary = tibble()))
+    return(list(df = df, summary = tibble(), plot = NULL))
   }
 
   df <- df %>%
@@ -387,7 +386,7 @@ Rdiscvr::SetLabKeyDefaults(baseUrl = 'https://prime-seq.ohsu.edu', defaultFolder
     distinct()
 
   if (nrow(art_timing) == 0 || is.na(art_timing$duration[1]) || art_timing$duration[1] < minARTDuration) {
-    return(list(df = df, summary = tibble()))
+    return(list(df = df, summary = tibble(), plot = NULL))
   }
 
   art_stop <- art_timing$art_release_dpi[1]
@@ -480,11 +479,10 @@ Rdiscvr::SetLabKeyDefaults(baseUrl = 'https://prime-seq.ohsu.edu', defaultFolder
   highlight_point(point_100, "purple")
   highlight_point(point_1000, "red")
 
-  print(gg)
-
   return(list(
     df = df,
-    summary = dplyr::bind_rows(summary_outcomes)
+    summary = dplyr::bind_rows(summary_outcomes),
+    plot = gg
   ))
 }
 
@@ -504,7 +502,7 @@ Rdiscvr::SetLabKeyDefaults(baseUrl = 'https://prime-seq.ohsu.edu', defaultFolder
                                  minDaysPostRelease = 14) {
   if (is.null(df) || nrow(df) == 0) {
     warning("Input dataframe is NULL or empty")
-    return(list(df = df, summary = tibble()))
+    return(list(df = df, summary = tibble(), plot = NULL))
   }
 
   df <- df %>%
@@ -530,7 +528,7 @@ Rdiscvr::SetLabKeyDefaults(baseUrl = 'https://prime-seq.ohsu.edu', defaultFolder
     distinct()
 
   if (nrow(art_timing) == 0 || is.na(art_timing$duration[1]) || art_timing$duration[1] < minARTDuration) {
-    return(list(df = df, summary = tibble()))
+    return(list(df = df, summary = tibble(), plot = NULL))
   }
 
   art_stop <- art_timing$art_release_dpi[1]
@@ -578,11 +576,10 @@ Rdiscvr::SetLabKeyDefaults(baseUrl = 'https://prime-seq.ohsu.edu', defaultFolder
                color = "purple", size = 3.5)
   }
 
-  print(gg)
-
   return(list(
     df = df,
-    summary = dplyr::bind_rows(summary_outcomes)
+    summary = dplyr::bind_rows(summary_outcomes),
+    plot = gg
   ))
 }
 
@@ -598,7 +595,7 @@ Rdiscvr::SetLabKeyDefaults(baseUrl = 'https://prime-seq.ohsu.edu', defaultFolder
 .AcutePhaseBurden <- function(df, acute_cutoff = 56) {
   if (is.null(df) || nrow(df) == 0) {
     warning("Input dataframe is NULL or empty")
-    return(list(df = df, summary = tibble()))
+    return(list(df = df, summary = tibble(), plot = NULL))
   }
 
   df <- df %>%
@@ -641,11 +638,10 @@ Rdiscvr::SetLabKeyDefaults(baseUrl = 'https://prime-seq.ohsu.edu', defaultFolder
     ) +
     theme_minimal()
 
-  print(gg)
-
   return(list(
     df = df,
-    summary = dplyr::bind_rows(summary_outcomes)
+    summary = dplyr::bind_rows(summary_outcomes),
+    plot = gg
   ))
 }
 
@@ -673,6 +669,7 @@ Run <- function(ids = NULL) {
   }
 
   all_summaries <- list()
+  all_plots <- list()
 
   for (id in ids) {
     message("Processing ID: ", id)
@@ -689,36 +686,47 @@ Run <- function(ids = NULL) {
     }
 
     id_summaries <- list()
+    id_plots <- list()
 
     res <- .ChronicPhaseSetpoint(df)
     df <- res$df
     id_summaries <- append(id_summaries, list(res$summary))
+    id_plots <- append(id_plots, list(res$plot))
 
     res <- .AcutePhasePeak(df)
     df <- res$df
     id_summaries <- append(id_summaries, list(res$summary))
+    id_plots <- append(id_plots, list(res$plot))
 
     res <- .OnARTBlipFrequency(df)
     df <- res$df
     id_summaries <- append(id_summaries, list(res$summary))
+    id_plots <- append(id_plots, list(res$plot))
 
     res <- .TimeToRebound(df)
     df <- res$df
     id_summaries <- append(id_summaries, list(res$summary))
+    id_plots <- append(id_plots, list(res$plot))
 
     res <- .PostReboundSetPoint(df)
     df <- res$df
     id_summaries <- append(id_summaries, list(res$summary))
+    id_plots <- append(id_plots, list(res$plot))
 
     res <- .AcutePhaseBurden(df)
     id_summaries <- append(id_summaries, list(res$summary))
+    id_plots <- append(id_plots, list(res$plot))
 
     all_summaries <- append(all_summaries, list(dplyr::bind_rows(id_summaries)))
+    all_plots[[id]] <- id_plots
   }
 
   combined_summary <- dplyr::bind_rows(all_summaries)
 
-  return(combined_summary)
+  return(list(
+    summary = combined_summary,
+    plots = all_plots
+  ))
 }
 
 UploadPVLOutcomes <- function(df) {
@@ -726,6 +734,8 @@ UploadPVLOutcomes <- function(df) {
     stop("No rows to upload.")
   }
 
+  df <- dplyr::rename(df, dataSource = datasource)
+  
   required_cols <- c("id", "date", "outcome", "numericValue", "stringValue", "comments", "dataSource")
   missing_cols <- setdiff(required_cols, names(df))
   if (length(missing_cols) > 0) {
@@ -753,4 +763,38 @@ UploadPVLOutcomes <- function(df) {
 
   message("Uploaded ", nrow(upload_df), " rows to pvl_outcomes.")
 }
+
+RunAndSaveImages <- function(ids = NULL, folder_path = NULL) {
+  if (is.null(ids)) stop("You must provide a vector of ids.")
+  if (is.null(folder_path)) stop("You must provide a folder path.")
+  if (!dir.exists(folder_path)) dir.create(folder_path, recursive = TRUE)
+
+  all_tables <- list()
+
+  for (id in ids) {
+    res <- Run(id)
+    
+    summary_with_id <- res$summary
+    summary_with_id$id <- id
+    all_tables[[id]] <- summary_with_id
+
+    plots_with_borders <- lapply(res$plots[[id]], function(p) {
+      p + theme(plot.background = element_rect(color = "black", size = 1))
+    })
+
+    plot <- wrap_plots(plots_with_borders, ncol = 2) +
+      plot_layout(guides = "collect") & 
+      theme(plot.margin = margin(10, 10, 10, 10))
+
+    file_path <- file.path(folder_path, paste0(id, ".png"))
+
+    ggsave(filename = file_path, plot = plot, width = 18, height = 16, dpi = 300)
+  }
+
+  combined_table <- dplyr::bind_rows(all_tables)
+
+  return(combined_table)
+}
+
+
 ```
