@@ -672,8 +672,6 @@ Run <- function(ids = NULL) {
   all_plots <- list()
 
   for (id in ids) {
-    message("Processing ID: ", id)
-
     df <- tryCatch({
       .GetData(id)
     }, error = function(e) {
@@ -772,6 +770,7 @@ RunAndSaveImages <- function(ids = NULL, folder_path = NULL) {
   all_tables <- list()
 
   for (id in ids) {
+    message("Processing ID: ", id)
     res <- Run(id)
     
     summary_with_id <- res$summary
@@ -779,22 +778,30 @@ RunAndSaveImages <- function(ids = NULL, folder_path = NULL) {
     all_tables[[id]] <- summary_with_id
 
     plots_with_borders <- lapply(res$plots[[id]], function(p) {
-      p + theme(plot.background = element_rect(color = "black", size = 1))
+      if (is.null(p)) {
+        ggplot() +
+          theme_void() +
+          theme(
+            plot.background = element_rect(color = "black", size = 1),
+            panel.background = element_rect(fill = "grey90", color = NA)
+          ) +
+          annotate("text", x = 0.5, y = 0.5, label = "No Data", size = 6)
+      } else {
+        p + theme(plot.background = element_rect(color = "black", size = 1))
+      }
     })
 
-    plot <- wrap_plots(plots_with_borders, ncol = 2) +
-      plot_layout(guides = "collect") & 
-      theme(plot.margin = margin(10, 10, 10, 10))
+    if (length(plots_with_borders) > 0) {
+      plot <- wrap_plots(plots_with_borders, ncol = 2) +
+        plot_layout(guides = "collect") & 
+        theme(plot.margin = margin(10, 10, 10, 10))
 
-    file_path <- file.path(folder_path, paste0(id, ".png"))
-
-    ggsave(filename = file_path, plot = plot, width = 18, height = 16, dpi = 300)
+      file_path <- file.path(folder_path, paste0(id, ".png"))
+      ggsave(filename = file_path, plot = plot, width = 18, height = 16, dpi = 300)
+    }
   }
 
   combined_table <- dplyr::bind_rows(all_tables)
-
   return(combined_table)
 }
-
-
 ```
