@@ -35,14 +35,14 @@ Rdiscvr::SetLabKeyDefaults(baseUrl = 'https://prime-seq.ohsu.edu', defaultFolder
 # Compute chronic phase viral load setpoints and plot the trajectory.
 #
 # This function calculates two geometric mean setpoints from 8–16 weeks post-infection:
-# - Pre-ART setpoint (if ART has not started)
-# - ATI setpoint (if ART has been initiated)
+# - Acute setpoint (if ART has not started)
+# - Post-ART setpoint (if ART has been initiated) or Chronic setpoint (if no ART)
 #
 # It requires a minimum number of points and a minimum time span for each window.
-# The function also computes a partial autocorrelation score (PACF) for pre-ART values
+# The function also computes a partial autocorrelation score (PACF) for acute values
 # and produces a line plot with ART annotations, chronic window bounds, and setpoint lines.
 #
-# Adds columns: Setpoint, ATI_Setpoint, Setpoint_PACF
+# Adds columns: Acute_Setpoint, Chronic_Setpoint, Setpoint_PACF
 # Prints: log-scaled viral load plot with annotations
 .ChronicPhaseSetpoint <- function(df = NULL, minPoints = 4, minDaysDuration = 7) {
   if (is.null(df) || nrow(df) == 0) {
@@ -53,91 +53,126 @@ Rdiscvr::SetLabKeyDefaults(baseUrl = 'https://prime-seq.ohsu.edu', defaultFolder
   df <- df %>%
     mutate(
       log10_pvl = log10(result),
-      postArt = ifelse(!is.na(artinformation_dayspostartinitiation), TRUE, FALSE),
+      hasART_flag = !is.na(artinformation_dayspostartinitiation),
       art_initiation_dpi = as.numeric(artinformation_artinitiation - timepostsivchallenge_infectiondate),
-      art_release_dpi = as.numeric(artinformation_artrelease - timepostsivchallenge_infectiondate)
+      art_release_dpi    = as.numeric(artinformation_artrelease    - timepostsivchallenge_infectiondate)
     )
 
+  subject_has_ART <- any(df$hasART_flag, na.rm = TRUE)
+
+  acute_df <- df %>%
+    filter(timepostsivchallenge_dayspostinfection < 56,
+           timepostsivchallenge_dayspostinfection > 0)
+
   chronic_df <- df %>%
-    filter(timepostsivchallenge_dayspostinfection >= 56, timepostsivchallenge_dayspostinfection <= 112)
+    filter(timepostsivchallenge_dayspostinfection >= 56,
+           timepostsivchallenge_dayspostinfection <= 112)
 
-  id <- unique(df$id)
-  date <- min(df$date, na.rm = TRUE)
+  id          <- unique(df$id)
+  date        <- suppressWarnings(min(df$date, na.rm = TRUE))
   data_source <- df$datasource[1]
-
   summary_outcomes <- list()
 
-  # Pre-ART Setpoint
-  pre_art_df <- chronic_df %>% filter(postArt == FALSE)
-  if (nrow(pre_art_df) >= minPoints &&
-      (max(pre_art_df$timepostsivchallenge_dayspostinfection) - min(pre_art_df$timepostsivchallenge_dayspostinfection)) >= minDaysDuration) {
-    setpoint <- exp(mean(log(pre_art_df$result)))
-    pacf_val <- pacf(log10(pre_art_df$result), plot = FALSE)$acf[1]
+  if (nrow(acute_df) >= minPoints &&
+      (max(acute_df$timepostsivchallenge_dayspostinfection) -
+       min(acute_df$timepostsivchallenge_dayspostinfection)) >= minDaysDuration) {
+
+    acute_setpoint <- exp(mean(log(acute_df$result)))
+    acute_pacf     <- pacf(log10(acute_df$result), plot = FALSE)$acf[1]
+
     summary_outcomes <- append(summary_outcomes, list(
-      .AppendSummaryRow(id, date, "preArtSetpoint", numeric_value = setpoint, data_source = data_source),
-      .AppendSummaryRow(id, date, "preArtSetpointPACF", numeric_value = pacf_val, data_source = data_source)
+      .AppendSummaryRow(id, date, "acutePhaseSetpoint",     numeric_value = acute_setpoint, data_source = data_source),
+      .AppendSummaryRow(id, date, "acutePhaseSetpointPACF", numeric_value = acute_pacf,     data_source = data_source)
     ))
   }
 
-  # Post-ART (ATI) Setpoint
-  post_art_df <- chronic_df %>% filter(postArt == TRUE)
-  if (nrow(post_art_df) >= minPoints &&
-      (max(post_art_df$timepostsivchallenge_dayspostinfection) - min(post_art_df$timepostsivchallenge_dayspostinfection)) >= minDaysDuration) {
-    ati_setpoint <- exp(mean(log(post_art_df$result)))
-    summary_outcomes <- append(summary_outcomes, list(
-      .AppendSummaryRow(id, date, "atiSetpoint", numeric_value = ati_setpoint, data_source = data_source)
-    ))
-  }
+  if (subject_has_ART) {
+    # Post-ART setpoint: only chronic-window rows that have the ART flag
+    post_art_df <- chronic_df %>% dplyr::filter(coalesce(hasART_flag, FALSE))
+    if (nrow(post_art_df) >= minPoints &&
+        (max(post_art_df$timepostsivchallenge_dayspostinfection) -
+         min(post_art_df$timepostsivchallenge_dayspostinfection)) >= minDaysDuration) {
 
-  y_label_pos <- min(df$result[df$result > 0], na.rm = TRUE) * 1.5
+      postART_setpoint <- exp(mean(log(post_art_df$result)))
+
+      summary_outcomes <- append(summary_outcomes, list(
+        .AppendSummaryRow(id, date, "postARTSetpoint", numeric_value = postART_setpoint, data_source = data_source)
+      ))
+    }
+  } else {
+    # No ART: chronic-phase setpoint from all chronic-window rows
+    if (nrow(chronic_df) >= minPoints &&
+        (max(chronic_df$timepostsivchallenge_dayspostinfection) -
+         min(chronic_df$timepostsivchallenge_dayspostinfection)) >= minDaysDuration) {
+
+      chronicPhase_setpoint <- exp(mean(log(chronic_df$result)))
+
+      summary_outcomes <- append(summary_outcomes, list(
+        .AppendSummaryRow(id, date, "chronicPhaseSetpoint", numeric_value = chronicPhase_setpoint, data_source = data_source)
+      ))
+    }
+  }
 
   gg <- ggplot(df, aes(x = timepostsivchallenge_dayspostinfection, y = result)) +
     geom_line(aes(group = id), color = "grey60") +
     geom_point(color = "grey70", size = 2) +
-    scale_y_log10(labels = trans_format("log10", math_format(10^.x))) +
+    scale_y_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
     geom_vline(data = df %>% filter(!is.na(art_initiation_dpi)),
                aes(xintercept = art_initiation_dpi), linetype = "dashed", color = "blue") +
     geom_vline(data = df %>% filter(!is.na(art_release_dpi)),
                aes(xintercept = art_release_dpi), linetype = "dashed", color = "red") +
-    geom_vline(xintercept = 56, linetype = "dotted", color = "darkgreen", linewidth = 0.8) +
+    geom_vline(xintercept = 56,  linetype = "dotted", color = "darkgreen", linewidth = 0.8) +
     geom_vline(xintercept = 112, linetype = "dotted", color = "darkgreen", linewidth = 0.8) +
-    geom_point(data = pre_art_df,
+    geom_point(data = acute_df,
                aes(x = timepostsivchallenge_dayspostinfection, y = result),
-               shape = 21, fill = "blue", color = "black", size = 3) +
-    geom_point(data = post_art_df,
-               aes(x = timepostsivchallenge_dayspostinfection, y = result),
-               shape = 21, fill = "red", color = "black", size = 3) +
+               shape = 21, fill = "blue", color = "black", size = 3, inherit.aes = FALSE) +
+    geom_point(
+      data = if (subject_has_ART) (chronic_df %>% dplyr::filter(coalesce(hasART_flag, FALSE))) else chronic_df,
+      aes(x = timepostsivchallenge_dayspostinfection, y = result),
+      shape = 21, fill = "red", color = "black", size = 3, inherit.aes = FALSE
+    ) +
     labs(
-      title = paste0("Chronic Phase Setpoint data for ", unique(df$id)),
+      title = paste0("Acute (0–56) and Chronic-Window (56–112) Setpoints for ", unique(df$id)),
       y = "Plasma Viral Load (copies/mL)",
       x = "Days Post Infection"
     ) +
-    annotate("text", x = 56, y = min(df$result[df$result > 0], na.rm = TRUE),
+    annotate("text", x = 56,
+             y = min(df$result[df$result > 0], na.rm = TRUE),
              label = "8 weeks", angle = 90, vjust = 1.2, hjust = 0,
              color = "darkgreen", size = 3.5) +
-    annotate("text", x = 112, y = min(df$result[df$result > 0], na.rm = TRUE),
+    annotate("text", x = 112,
+             y = min(df$result[df$result > 0], na.rm = TRUE),
              label = "16 weeks", angle = 90, vjust = 1.2, hjust = 0,
              color = "darkgreen", size = 3.5) +
     theme_minimal()
 
-  if (exists("setpoint") && !is.na(setpoint)) {
+  if (exists("acute_setpoint") && !is.na(acute_setpoint)) {
     gg <- gg +
-      geom_hline(yintercept = setpoint, linetype = "solid", color = "blue", linewidth = 0.4) +
+      geom_hline(yintercept = acute_setpoint, linetype = "solid", color = "blue", linewidth = 0.4) +
       annotate("text", x = min(df$timepostsivchallenge_dayspostinfection, na.rm = TRUE),
-               y = setpoint, label = "Setpoint", hjust = -0.1, vjust = -0.5,
+               y = acute_setpoint, label = "Acute-Phase Setpoint", hjust = -0.1, vjust = -0.5,
                color = "blue", size = 3.5)
   }
 
-  if (exists("ati_setpoint") && !is.na(ati_setpoint)) {
+  if (subject_has_ART && exists("postART_setpoint") && !is.na(postART_setpoint)) {
     gg <- gg +
-      geom_hline(yintercept = ati_setpoint, linetype = "solid", color = "red", linewidth = 0.4) +
+      geom_hline(yintercept = postART_setpoint, linetype = "solid", color = "red", linewidth = 0.4) +
       annotate("text", x = min(df$timepostsivchallenge_dayspostinfection, na.rm = TRUE),
-               y = ati_setpoint, label = "ATI Setpoint", hjust = -0.1, vjust = -0.5,
+               y = postART_setpoint, label = "Post-ART Setpoint", hjust = -0.1, vjust = -0.5,
                color = "red", size = 3.5)
   }
 
+  if (!subject_has_ART && exists("chronicPhase_setpoint") && !is.na(chronicPhase_setpoint)) {
+    gg <- gg +
+      geom_hline(yintercept = chronicPhase_setpoint, linetype = "solid", color = "red", linewidth = 0.4) +
+      annotate("text", x = min(df$timepostsivchallenge_dayspostinfection, na.rm = TRUE),
+               y = chronicPhase_setpoint, label = "Chronic-Phase Setpoint", hjust = -0.1, vjust = -0.5,
+               color = "red", size = 3.5)
+  }
+
+  # ART text labels (if present)
   art_initiation_x <- df %>% filter(!is.na(art_initiation_dpi)) %>% distinct(art_initiation_dpi) %>% pull()
-  art_release_x <- df %>% filter(!is.na(art_release_dpi)) %>% distinct(art_release_dpi) %>% pull()
+  art_release_x    <- df %>% filter(!is.na(art_release_dpi))    %>% distinct(art_release_dpi)    %>% pull()
 
   if (length(art_initiation_x) > 0) {
     gg <- gg + annotate("text", x = art_initiation_x[1],
@@ -158,6 +193,8 @@ Rdiscvr::SetLabKeyDefaults(baseUrl = 'https://prime-seq.ohsu.edu', defaultFolder
     plot = gg
   ))
 }
+
+
 
 
 # Identify acute phase peak viral load and plot the trajectory.
@@ -804,4 +841,9 @@ RunAndSaveImages <- function(ids = NULL, folder_path = NULL) {
   combined_table <- dplyr::bind_rows(all_tables)
   return(combined_table)
 }
+
+df <- RunAndSaveImages(ids = ids, folder_path = "~/work/pvl-stats-output")
+primeseq_res <- UploadPVLOutcomes(df)
+
+
 ```
