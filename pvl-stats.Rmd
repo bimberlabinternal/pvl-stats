@@ -1,0 +1,1046 @@
+Labkey setup
+```{r setup, include=FALSE}
+library(Rdiscvr)
+library(dplyr)
+library(Rlabkey)
+library(forecast)
+library(scales)
+library(pracma)
+library(ggplot2)
+library(patchwork)
+library(officer)
+library(PvlTimeSeriesSegmentation)
+
+knitr::opts_chunk$set(echo = TRUE)
+
+Rdiscvr::SetLabKeyDefaults(baseUrl = 'https://prime-seq.ohsu.edu', defaultFolder = '/Labs/Bimber')
+```
+
+```{r}
+#' Process segmentation results to compute setpoints from top 2 runs
+#'
+#' @param result List containing segmentation results from SegmentWrapper
+#' @param min_points_per_run Minimum points required per run for valid setpoint
+#' @param large_run_threshold Percentage threshold for flagging too many large runs
+#' @param max_runs_before_warning Maximum number of runs before warning flag
+#' @param skip_basin1 If TRUE (default), automatically skip Basin1 when ranking basins
+#' @return List containing setpoints, flags, and visualization
+.ProcessSegmentationSetpoints <- function(result, 
+                                       min_points_per_run = 3,
+                                       large_run_threshold = 0.20,
+                                       max_runs_before_warning = 6,
+                                       skip_basin1 = TRUE) {
+  
+  # Initialize return structure
+  output <- list(
+    setpoints = data.frame(),
+    flags = list(),
+    plot = NULL,
+    summary = list()
+  )
+  
+  # Check if result structure is valid
+  if (is.null(result) || is.null(result$data) || is.null(result$classification_summary)) {
+    output$flags$invalid_structure <- TRUE
+    return(output)
+  }
+  
+  data_df <- result$data
+  state_counts <- result$classification_summary$state_label_counts
+  
+  # Check for insufficient state labels
+  if (length(state_counts) < 2) {
+    output$flags$insufficient_states <- TRUE
+    output$flags$n_states <- length(state_counts)
+    return(output)
+  }
+  
+  # Convert state counts to data frame and rank by count
+  state_counts_df <- data.frame(
+    state_label = names(state_counts),
+    count = unlist(state_counts),
+    stringsAsFactors = FALSE
+  ) %>%
+    arrange(desc(count)) %>%
+    mutate(
+      rank = row_number(),
+      percentage = count / sum(count)
+    )
+  
+  # Filter out Basin1 if skip_basin1 is TRUE
+  if (skip_basin1) {
+    # Flag if Basin1 was skipped
+    basin1_present <- any(state_counts_df$state_label == "Basin1")
+    if (basin1_present) {
+      basin1_info <- state_counts_df %>% filter(state_label == "Basin1")
+      output$flags$basin1_skipped <- TRUE
+      output$flags$basin1_info <- basin1_info
+    }
+    
+    # Remove Basin1 from consideration for top runs
+    state_counts_filtered <- state_counts_df %>% 
+      filter(state_label != "Basin1") %>%
+      mutate(rank = row_number())  # Re-rank after filtering
+  } else {
+    state_counts_filtered <- state_counts_df
+  }
+  
+  # Check for insufficient remaining state labels after filtering
+  if (nrow(state_counts_filtered) < 2) {
+    output$flags$insufficient_states_after_filter <- TRUE
+    output$flags$n_states_after_filter <- nrow(state_counts_filtered)
+    return(output)
+  }
+  
+  # Check for too many large runs (using original percentages)
+  large_runs <- state_counts_df %>% filter(percentage > large_run_threshold)
+  if (nrow(large_runs) > 2) {
+    output$flags$too_many_large_runs <- TRUE
+    output$flags$n_large_runs <- nrow(large_runs)
+    output$flags$large_runs_info <- large_runs
+  }
+  
+  # Get top 2 runs from filtered data
+  top_2_runs <- state_counts_filtered %>% slice_head(n = 2)
+  
+  # Check if top 2 runs have sufficient points
+  insufficient_runs <- top_2_runs %>% filter(count < min_points_per_run)
+  if (nrow(insufficient_runs) > 0) {
+    output$flags$insufficient_points_in_top_runs <- TRUE
+    output$flags$insufficient_runs_info <- insufficient_runs
+  }
+  
+  if(nrow(state_counts_df) > max_runs_before_warning) {
+    output$flags$too_many_runs <- TRUE
+  }
+  
+  # Assign phases based on temporal order (which starts earlier)
+  # Get the earliest date for each of the top 2 runs to determine temporal order
+  temporal_assignment <- list()
+  for (i in 1:nrow(top_2_runs)) {
+    state_label <- top_2_runs$state_label[i]
+    state_data <- data_df %>% filter(state_label == !!state_label)
+    earliest_date <- min(state_data$date, na.rm = TRUE)
+    temporal_assignment[[i]] <- data.frame(
+      state_label = state_label,
+      earliest_date = earliest_date,
+      count = top_2_runs$count[i],
+      percentage = top_2_runs$percentage[i]
+    )
+  }
+  
+  # Combine and sort by earliest date to determine temporal order
+  temporal_df <- bind_rows(temporal_assignment) %>%
+    arrange(earliest_date) %>%
+    mutate(temporal_rank = row_number())  # Rank 1 = acute (earlier), Rank 2 = chronic (later)
+  
+  # Compute setpoints for valid runs using temporal ranking
+  setpoints_list <- list()
+  
+  for (i in 1:nrow(temporal_df)) {
+    run_info <- temporal_df[i, ]
+    state_label <- run_info$state_label
+    
+    if (run_info$count >= min_points_per_run) {
+      # Filter data for this state_label
+      state_data <- data_df %>% filter(state_label == !!state_label)
+      
+      # Back-transform from log10 if needed and compute geometric mean
+      # The segmentation data appears to be in log10 space already
+      # So we need to back-transform: 10^(log10_values)
+      raw_values <- 10^(state_data$value)
+      
+      # Compute geometric mean setpoint
+      geometric_mean_setpoint <- exp(mean(log(raw_values)))
+      
+      setpoints_list[[i]] <- data.frame(
+        rank = run_info$temporal_rank,  # Use temporal rank instead of size rank
+        state_label = state_label,
+        n_points = run_info$count,
+        percentage = run_info$percentage,
+        setpoint = geometric_mean_setpoint,
+        log10_setpoint = log10(geometric_mean_setpoint),
+        stringsAsFactors = FALSE
+      )
+    }
+  }
+  
+  # Combine setpoints
+  if (length(setpoints_list) > 0) {
+    output$setpoints <- bind_rows(setpoints_list)
+  }
+  
+  # Create pvl-stats style plot
+  output$plot <- .CreateSetpointPlot(data_df, output$setpoints, top_2_runs)
+  
+  # Summary information
+  output$summary <- list(
+    total_points = nrow(data_df),
+    n_states = length(state_counts),
+    top_2_states = top_2_runs$state_label,
+    setpoints_computed = nrow(output$setpoints)
+  )
+  
+  return(output)
+}
+
+#' Create pvl-stats style plot showing segmentation results with setpoints
+#'
+#' @param data_df Segmentation data
+#' @param setpoints_df Computed setpoints
+#' @param top_2_runs Information about top 2 runs
+#' @return ggplot object
+.CreateSetpointPlot <- function(data_df, setpoints_df, top_2_runs) {
+  
+  # Create base plot
+  gg <- ggplot(data_df, aes(x = date, y = 10^value)) +
+    geom_line(aes(group = 1), color = "grey60", linewidth = 0.5) +
+    geom_point(aes(color = state_label), size = 2.5, alpha = 0.8) +
+    scale_y_log10(labels = trans_format("log10", math_format(10^.x))) +
+    labs(
+      title = paste0("Viral Load Time Series Segmentation"),
+      y = "Viral Load (copies/mL)", 
+      x = "Date",
+      color = "State Label"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(size = 14, face = "bold"),
+      axis.title = element_text(size = 12),
+      legend.position = "bottom",
+      panel.grid.minor = element_line(color = "grey95", size = 0.3)
+    )
+  
+  # Add setpoint horizontal lines
+  if (nrow(setpoints_df) > 0) {
+    colors <- c("blue", "red", "purple", "orange")  # Colors for different ranks
+    
+    for (i in 1:nrow(setpoints_df)) {
+      setpoint_info <- setpoints_df[i, ]
+      color <- colors[min(i, length(colors))]
+      
+      gg <- gg + 
+        geom_hline(yintercept = setpoint_info$setpoint, 
+                   linetype = "solid", 
+                   color = color, 
+                   linewidth = 0.6, 
+                   alpha = 0.8) +
+        annotate("text", 
+                 x = min(data_df$date, na.rm = TRUE),
+                 y = setpoint_info$setpoint,
+                 label = paste0("Rank ", setpoint_info$rank, " Setpoint (", 
+                               setpoint_info$state_label, "): ",
+                               round(setpoint_info$setpoint, 0), " copies/mL"),
+                 hjust = 0, vjust = -0.5, color = color, size = 3)
+    }
+  }
+  
+  # Add subtitle with summary info
+  if (nrow(top_2_runs) >= 2) {
+    subtitle_text <- paste0(
+      "Top 2 runs: ", 
+      paste(paste0(top_2_runs$state_label, " (", top_2_runs$count, " pts, ", 
+                   round(top_2_runs$percentage * 100, 1), "%)"), 
+            collapse = ", ")
+    )
+    gg <- gg + labs(subtitle = subtitle_text)
+  }
+  
+  return(gg)
+}
+
+.AppendSummaryRow <- function(id, date, outcome, numeric_value = NA, string_value = NA, comment = NA, data_source = NA) {
+  if (is.na(numeric_value) && is.na(string_value)) {
+    return(NULL)
+  }
+
+  tibble::tibble(
+    id = id,
+    date = date,
+    outcome = outcome,
+    numericValue = numeric_value,
+    stringValue = string_value,
+    comments = comment,
+    datasource = data_source
+  )
+}
+
+# Detect if a subject has ART treatment
+#
+# Determines ART status based on presence of valid ART initiation data
+# Returns TRUE if subject has ART, FALSE otherwise
+.DetectARTStatus <- function(df) {
+  if (is.null(df) || nrow(df) == 0) {
+    return(FALSE)
+  }
+  
+  # Check if any rows have valid ART initiation date
+  has_art <- any(!is.na(df$artinformation_artinitiation), na.rm = TRUE)
+  
+  return(has_art)
+}
+
+# ART Pipeline: Compute metrics for subjects with ART treatment
+#
+# Processes subjects with ART using defined phases:
+# - Acute phase: infection to ART initiation
+# - On-ART phase: ART initiation to ART release
+# - Post-rebound phase: ART release onwards
+RunARTPipeline <- function(df) {
+  if (is.null(df) || nrow(df) == 0) {
+    warning("Input dataframe is NULL or empty")
+    return(list(df = df, summary = tibble(), metrics = list()))
+  }
+
+  df <- df %>%
+    mutate(
+      dpi = timepostsivchallenge_dayspostinfection,
+      art_initiation_dpi = as.numeric(artinformation_artinitiation - timepostsivchallenge_infectiondate),
+      art_release_dpi = as.numeric(artinformation_artrelease - timepostsivchallenge_infectiondate)
+    )
+
+  id <- unique(df$id)
+  date <- min(df$date, na.rm = TRUE)
+  data_source <- df$datasource[1]
+  summary_outcomes <- list()
+  computed_metrics <- list()
+
+  # Define phases
+  art_start <- df %>% filter(!is.na(art_initiation_dpi)) %>% pull(art_initiation_dpi) %>% unique()
+  art_end <- df %>% filter(!is.na(art_release_dpi)) %>% pull(art_release_dpi) %>% unique()
+  
+  if (length(art_start) == 0) {
+    warning("No valid ART initiation date found")
+    return(list(df = df, summary = tibble(), metrics = list()))
+  }
+  
+  art_start <- art_start[1]  # Take first if multiple
+  art_end <- if (length(art_end) > 0) art_end[1] else NA
+  
+  # Phase-specific data
+  acute_df <- df %>% filter(dpi < art_start, dpi >= 0)
+  onart_df <- df %>% filter(dpi >= art_start, if (!is.na(art_end)) dpi <= art_end else TRUE)
+  postrebound_df <- if (!is.na(art_end)) df %>% filter(dpi > art_end) else tibble()
+  
+  # Store phase information
+  computed_metrics$phases <- list(
+    art_start = art_start,
+    art_end = art_end,
+    has_rebound_phase = !is.na(art_end)
+  )
+  
+  # 1. Acute Phase Peak and Setpoint
+  if (nrow(acute_df) > 0) {
+    peak_row <- acute_df %>% filter(result == max(result, na.rm = TRUE)) %>% slice(1)
+    acute_peak <- peak_row$result
+    acute_peak_day <- peak_row$dpi
+    
+    # Acute phase setpoint (geometric mean of acute phase)
+    acute_setpoint <- exp(mean(log(acute_df$result)))
+    
+    summary_outcomes <- append(summary_outcomes, list(
+      .AppendSummaryRow(id, date, "acutePhasePeak_pVL", numeric_value = acute_peak, data_source = data_source),
+      .AppendSummaryRow(id, date, "acutePhasePeak_day", numeric_value = acute_peak_day, data_source = data_source),
+      .AppendSummaryRow(id, date, "acutePhaseSetpoint", numeric_value = acute_setpoint, data_source = data_source)
+    ))
+    
+    computed_metrics$acute_peak <- list(value = acute_peak, day = acute_peak_day)
+    computed_metrics$acute_setpoint <- acute_setpoint
+  }
+  
+  # 2. Acute Phase Burden (AUC)
+  if (nrow(acute_df) >= 2) {
+    acute_df_sorted <- acute_df %>% arrange(dpi)
+    auc <- trapz(acute_df_sorted$dpi, acute_df_sorted$result)
+    
+    summary_outcomes <- append(summary_outcomes, list(
+      .AppendSummaryRow(id, date, "acutePhaseBurden", numeric_value = auc, data_source = data_source)
+    ))
+    
+    computed_metrics$acute_burden <- auc
+  }
+  
+  # 3. On-ART Setpoint (entire on-ART period)
+  if (nrow(onart_df) >= 3) {
+    onart_setpoint <- exp(mean(log(onart_df$result)))
+    
+    summary_outcomes <- append(summary_outcomes, list(
+      .AppendSummaryRow(id, date, "onArtSetpoint", numeric_value = onart_setpoint, data_source = data_source)
+    ))
+    
+    computed_metrics$onart_setpoint <- onart_setpoint
+  }
+  
+  # 4. On-ART Blip Frequency
+  onart_blips <- onart_df %>% 
+    filter(!is.na(result), !is.na(lod), result > lod)
+  blip_count <- nrow(onart_blips)
+  
+  if (blip_count > 0) {
+    summary_outcomes <- append(summary_outcomes, list(
+      .AppendSummaryRow(id, date, "onArtBlipCount", numeric_value = blip_count, data_source = data_source)
+    ))
+  }
+  computed_metrics$onart_blips <- list(count = blip_count, data = onart_blips)
+  
+  # 5. Time to Rebound and Post-Rebound Setpoint (only if ART release exists)
+  if (!is.na(art_end) && nrow(postrebound_df) > 0) {
+    # Time to rebound
+    lod_val <- max(df$lod, na.rm = TRUE)
+    
+    first_rebound_lod <- postrebound_df %>% 
+      filter(result > lod_val) %>% 
+      arrange(dpi) %>% 
+      slice(1)
+    
+    first_rebound_100 <- postrebound_df %>% 
+      filter(result > 100) %>% 
+      arrange(dpi) %>% 
+      slice(1)
+    
+    first_rebound_1000 <- postrebound_df %>% 
+      filter(result > 1000) %>% 
+      arrange(dpi) %>% 
+      slice(1)
+    
+    if (nrow(first_rebound_lod) > 0) {
+      rebound_time_lod <- first_rebound_lod$dpi - art_end
+      summary_outcomes <- append(summary_outcomes, list(
+        .AppendSummaryRow(id, date, "timeToRebound_LOD", numeric_value = rebound_time_lod, data_source = data_source)
+      ))
+      computed_metrics$rebound_time_lod <- list(time = rebound_time_lod, day = first_rebound_lod$dpi, value = first_rebound_lod$result)
+    }
+    
+    if (nrow(first_rebound_100) > 0) {
+      rebound_time_100 <- first_rebound_100$dpi - art_end
+      summary_outcomes <- append(summary_outcomes, list(
+        .AppendSummaryRow(id, date, "timeToRebound_100", numeric_value = rebound_time_100, data_source = data_source)
+      ))
+      computed_metrics$rebound_time_100 <- list(time = rebound_time_100, day = first_rebound_100$dpi, value = first_rebound_100$result)
+    }
+    
+    if (nrow(first_rebound_1000) > 0) {
+      rebound_time_1000 <- first_rebound_1000$dpi - art_end
+      summary_outcomes <- append(summary_outcomes, list(
+        .AppendSummaryRow(id, date, "timeToRebound_1000", numeric_value = rebound_time_1000, data_source = data_source)
+      ))
+      computed_metrics$rebound_time_1000 <- list(time = rebound_time_1000, day = first_rebound_1000$dpi, value = first_rebound_1000$result)
+    }
+    
+    # Post-rebound setpoint (14+ days after ART release)
+    postrebound_setpoint_df <- postrebound_df %>% filter(dpi > (art_end + 14))
+    if (nrow(postrebound_setpoint_df) >= 3) {
+      postrebound_setpoint <- exp(mean(log(postrebound_setpoint_df$result)))
+      
+      summary_outcomes <- append(summary_outcomes, list(
+        .AppendSummaryRow(id, date, "postReboundSetpoint", numeric_value = postrebound_setpoint, data_source = data_source)
+      ))
+      
+      computed_metrics$postrebound_setpoint <- postrebound_setpoint
+    }
+  }
+  
+  return(list(
+    df = df,
+    summary = dplyr::bind_rows(summary_outcomes),
+    metrics = computed_metrics
+  ))
+}
+
+# Non-ART Pipeline: Use segmentation analysis for subjects without ART
+#
+# Uses dynamic segmentation to identify acute and chronic phases
+# Computes setpoints based on top 2 runs from segmentation
+RunNoARTPipeline <- function(df) {
+  if (is.null(df) || nrow(df) == 0) {
+    warning("Input dataframe is NULL or empty")
+    return(list(df = df, summary = tibble(), metrics = list()))
+  }
+
+  id <- unique(df$id)
+  date <- min(df$date, na.rm = TRUE)
+  data_source <- df$datasource[1]
+  summary_outcomes <- list()
+  computed_metrics <- list()
+  
+  # Prepare data for segmentation (log transform for segmentation)
+  seg_data <- df %>%
+    arrange(date) %>%
+    mutate(
+      result_adj = ifelse(result < 10, 10, result),
+      result_adj = ifelse(result_adj < lod, lod/2, result_adj),
+      result_log = log10(result_adj)
+    ) %>%
+    filter(!is.na(result_log))
+  
+  if (nrow(seg_data) < 5) {
+    warning("Insufficient data points for segmentation analysis")
+    return(list(df = df, summary = tibble(), metrics = list()))
+  }
+  
+  if (var(seg_data$result_log) == 0) {
+    warning("Zero variance in data - cannot perform segmentation")
+    return(list(df = df, summary = tibble(), metrics = list()))
+  }
+  
+  # Run segmentation
+  segmentation_result <- tryCatch({
+    SegmentWrapper(
+      data = seg_data %>% select(date, result = result_log),
+      n_points = 30,
+      method = "spline",
+      density_threshold = 0.05,
+      min_basin_size = 3,
+      variance_threshold = 0.5,
+      prepended_aviremic_phase = TRUE
+    )
+  }, error = function(e) {
+    warning("Segmentation failed: ", e$message)
+    return(NULL)
+  })
+  
+  if (is.null(segmentation_result)) {
+    warning("Segmentation analysis failed")
+    return(list(df = df, summary = tibble(), metrics = list()))
+  }
+  
+  # Process segmentation to get setpoints
+  setpoint_analysis <- .ProcessSegmentationSetpoints(segmentation_result)
+  print(setpoint_analysis$plot)
+  computed_metrics$segmentation <- setpoint_analysis
+  computed_metrics$segmentation_raw <- segmentation_result
+  
+  # Extract setpoints
+  if (nrow(setpoint_analysis$setpoints) > 0) {
+    # Rank 1 setpoint (acute phase)
+    rank1_setpoint <- setpoint_analysis$setpoints %>% filter(rank == 1) %>% pull(setpoint)
+    if (length(rank1_setpoint) > 0) {
+      summary_outcomes <- append(summary_outcomes, list(
+        .AppendSummaryRow(id, date, "acutePhaseSetpoint", numeric_value = rank1_setpoint[1], data_source = data_source)
+      ))
+      computed_metrics$acute_setpoint <- rank1_setpoint[1]
+    }
+    
+    # Rank 2 setpoint (chronic/latent phase)
+    rank2_setpoint <- setpoint_analysis$setpoints %>% filter(rank == 2) %>% pull(setpoint)
+    if (length(rank2_setpoint) > 0) {
+      summary_outcomes <- append(summary_outcomes, list(
+        .AppendSummaryRow(id, date, "chronicPhaseSetpoint", numeric_value = rank2_setpoint[1], data_source = data_source)
+      ))
+      computed_metrics$chronic_setpoint <- rank2_setpoint[1]
+    }
+  }
+  
+  # Map segmentation basins to original data points for phase assignment
+  # Extract date ranges from segmentation basins and map to original real data
+  if (!is.null(segmentation_result$data)) {
+    seg_data_labeled <- segmentation_result$data
+    
+    # Debug: log segmentation results
+    cat("Original data points:", nrow(df), "\n")
+    cat("Segmentation synthetic points:", nrow(seg_data_labeled), "\n")
+    if (nrow(setpoint_analysis$setpoints) > 0) {
+      for (i in 1:nrow(setpoint_analysis$setpoints)) {
+        sp <- setpoint_analysis$setpoints[i,]
+        cat("Rank", sp$rank, "state:", sp$state_label, "- segmentation points:", sp$n_points, "\n")
+      }
+    }
+    
+    if (nrow(setpoint_analysis$setpoints) > 0) {
+      # Get basin info for phase mapping
+      acute_state <- setpoint_analysis$setpoints %>% filter(rank == 1) %>% pull(state_label)
+      chronic_state <- if (nrow(setpoint_analysis$setpoints) > 1) {
+        setpoint_analysis$setpoints %>% filter(rank == 2) %>% pull(state_label)
+      } else NULL
+      
+      if (length(acute_state) > 0) {
+        # Get date ranges for each basin from segmentation data
+        acute_seg_points <- seg_data_labeled %>% filter(state_label == acute_state[1])
+        acute_date_range <- c(min(acute_seg_points$date), max(acute_seg_points$date))
+        
+        chronic_date_range <- NULL
+        if (!is.null(chronic_state) && length(chronic_state) > 0) {
+          chronic_seg_points <- seg_data_labeled %>% filter(state_label == chronic_state[1])
+          chronic_date_range <- c(min(chronic_seg_points$date), max(chronic_seg_points$date))
+        }
+        
+        cat("Acute basin date range:", as.character(acute_date_range[1]), "to", as.character(acute_date_range[2]), "\n")
+        if (!is.null(chronic_date_range)) {
+          cat("Chronic basin date range:", as.character(chronic_date_range[1]), "to", as.character(chronic_date_range[2]), "\n")
+        }
+        
+        # Map original data points to phases based on date ranges
+        acute_df <- df %>% 
+          filter(date >= acute_date_range[1] & date <= acute_date_range[2]) %>%
+          arrange(timepostsivchallenge_dayspostinfection)
+        
+        chronic_df <- tibble()
+        if (!is.null(chronic_date_range)) {
+          chronic_df <- df %>% 
+            filter(date >= chronic_date_range[1] & date <= chronic_date_range[2]) %>%
+            arrange(timepostsivchallenge_dayspostinfection)
+        }
+        
+        cat("Mapped to original data - Acute:", nrow(acute_df), "points, Chronic:", nrow(chronic_df), "points\n")
+        
+        # Store phase data for visualization and calculations
+        computed_metrics$acute_phase_data <- acute_df
+        if (nrow(chronic_df) > 0) {
+          computed_metrics$chronic_phase_data <- chronic_df
+        }
+        
+        # Recalculate setpoints using original data (override segmentation-based setpoints)
+        if (nrow(acute_df) > 0) {
+          computed_metrics$acute_setpoint <- exp(mean(log(acute_df$result)))
+          # Update summary with recalculated setpoint
+          for (i in seq_along(summary_outcomes)) {
+            if (!is.null(summary_outcomes[[i]]) && summary_outcomes[[i]]$outcome == "acutePhaseSetpoint") {
+              summary_outcomes[[i]]$numericValue <- computed_metrics$acute_setpoint
+              break
+            }
+          }
+        }
+        
+        if (nrow(chronic_df) > 0) {
+          computed_metrics$chronic_setpoint <- exp(mean(log(chronic_df$result)))
+          # Update summary with recalculated setpoint  
+          for (i in seq_along(summary_outcomes)) {
+            if (!is.null(summary_outcomes[[i]]) && summary_outcomes[[i]]$outcome == "chronicPhaseSetpoint") {
+              summary_outcomes[[i]]$numericValue <- computed_metrics$chronic_setpoint
+              break
+            }
+          }
+        }
+        
+        # Acute phase peak from original data
+        if (nrow(acute_df) > 0) {
+          peak_row <- acute_df %>% filter(result == max(result, na.rm = TRUE)) %>% slice(1)
+          acute_peak <- peak_row$result
+          acute_peak_day <- peak_row$timepostsivchallenge_dayspostinfection
+          
+          summary_outcomes <- append(summary_outcomes, list(
+            .AppendSummaryRow(id, date, "acutePhasePeak_pVL", numeric_value = acute_peak, data_source = data_source),
+            .AppendSummaryRow(id, date, "acutePhasePeak_day", numeric_value = acute_peak_day, data_source = data_source)
+          ))
+          
+          computed_metrics$acute_peak <- list(value = acute_peak, day = acute_peak_day)
+          cat("Acute peak (from original data):", acute_peak, "at day", acute_peak_day, "\n")
+        }
+        
+        # Acute phase burden (AUC) from original data
+        if (nrow(acute_df) >= 2) {
+          acute_df_sorted <- acute_df %>% arrange(timepostsivchallenge_dayspostinfection)
+          auc <- trapz(acute_df_sorted$timepostsivchallenge_dayspostinfection, acute_df_sorted$result)
+          
+          summary_outcomes <- append(summary_outcomes, list(
+            .AppendSummaryRow(id, date, "acutePhaseBurden", numeric_value = auc, data_source = data_source)
+          ))
+          
+          computed_metrics$acute_burden <- auc
+          cat("Acute AUC (from original data):", auc, "from", nrow(acute_df_sorted), "original points\n")
+        }
+        
+        # Calculate phase boundary from original data transition
+        if (nrow(acute_df) > 0 && nrow(chronic_df) > 0) {
+          acute_max_day <- max(acute_df$timepostsivchallenge_dayspostinfection, na.rm = TRUE)
+          chronic_min_day <- min(chronic_df$timepostsivchallenge_dayspostinfection, na.rm = TRUE)
+          
+          # Find the actual transition point in original data
+          all_days <- sort(df$timepostsivchallenge_dayspostinfection)
+          transition_candidates <- all_days[all_days > acute_max_day & all_days < chronic_min_day]
+          
+          if (length(transition_candidates) > 0) {
+            computed_metrics$phase_boundary <- median(transition_candidates)
+          } else {
+            computed_metrics$phase_boundary <- (acute_max_day + chronic_min_day) / 2
+          }
+          
+          cat("Phase boundary (from original data) at day:", computed_metrics$phase_boundary, "\n")
+        }
+      }
+    }
+  }
+  
+  return(list(
+    df = df,
+    summary = dplyr::bind_rows(summary_outcomes),
+    metrics = computed_metrics
+  ))
+}
+
+# Create unified time series visualization
+#
+# Generates a single comprehensive plot showing all computed metrics
+# Uses days post infection as x-axis and includes all relevant annotations
+CreateUnifiedTimeSeriesPlot <- function(df, metrics, has_art = FALSE) {
+  if (is.null(df) || nrow(df) == 0) {
+    return(ggplot() + 
+           theme_void() + 
+           annotate("text", x = 0.5, y = 0.5, label = "No Data Available", size = 6))
+  }
+  
+  df <- df %>% mutate(dpi = timepostsivchallenge_dayspostinfection)
+  id <- unique(df$id)[1]
+  max_x <- max(df$dpi, na.rm = TRUE)
+  
+  # Base plot
+  gg <- ggplot(df, aes(x = dpi, y = result)) +
+    geom_line(aes(group = id), color = "grey60", linewidth = 0.5) +
+    geom_point(color = "grey70", size = 2, alpha = 0.7) +
+    scale_y_log10(labels = trans_format("log10", math_format(10^.x))) +
+    labs(
+      title = paste0("Viral Load Outcomes - Subject ", id),
+      subtitle = if (has_art) "ART Treatment" else "No ART Treatment",
+      y = "Plasma Viral Load (copies/mL)",
+      x = "Days Post Infection"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(size = 14, face = "bold"),
+      plot.subtitle = element_text(size = 12, color = "grey40"),
+      legend.position = "none"
+    )
+  
+  # Add ART-specific annotations
+  if (has_art && !is.null(metrics$phases)) {
+    phases <- metrics$phases
+    
+    # ART initiation line
+    if (!is.na(phases$art_start)) {
+      gg <- gg + 
+        geom_vline(xintercept = phases$art_start, linetype = "dashed", color = "blue", linewidth = 0.8) +
+        annotate("text", x = phases$art_start, y = min(df$result[df$result > 0], na.rm = TRUE),
+                 label = "ART Initiation", angle = 90, vjust = 1.2, hjust = 0, color = "blue", size = 3.5)
+    }
+    
+    # ART release line
+    if (!is.na(phases$art_end)) {
+      gg <- gg + 
+        geom_vline(xintercept = phases$art_end, linetype = "dashed", color = "red", linewidth = 0.8) +
+        annotate("text", x = phases$art_end, y = min(df$result[df$result > 0], na.rm = TRUE),
+                 label = "ART Release", angle = 90, vjust = 1.2, hjust = 0, color = "red", size = 3.5)
+    }
+  }
+  
+  # Add phase-specific setpoint lines
+  y_min <- min(df$result[df$result > 0], na.rm = TRUE)
+  
+  if (has_art && !is.null(metrics$phases)) {
+    phases <- metrics$phases
+    
+    # Acute phase setpoint (from 0 to ART start)
+    if (!is.null(metrics$acute_setpoint) && !is.na(phases$art_start)) {
+      gg <- gg +
+        geom_segment(x = 0, xend = max_x,
+                     y = metrics$acute_setpoint, yend = metrics$acute_setpoint,
+                     linetype = "solid", color = "orange", linewidth = 0.6, alpha = 0.8) +
+        annotate("text", x = phases$art_start/2, y = metrics$acute_setpoint,
+                 label = paste0("Acute setpoint:\n", round(metrics$acute_setpoint, 0), " copies/mL"),
+                 hjust = 0.5, vjust = -0.5, color = "orange", size = 3.2)
+    }
+    
+    # On-ART setpoint (from ART start to ART end or end of data)
+    if (!is.null(metrics$onart_setpoint)) {
+      art_end_x <- if (!is.na(phases$art_end)) phases$art_end else max(df$dpi, na.rm = TRUE)
+      gg <- gg +
+        geom_segment(x = phases$art_start, xend = max_x,
+                     y = metrics$onart_setpoint, yend = metrics$onart_setpoint,
+                     linetype = "solid", color = "blue", linewidth = 0.6, alpha = 0.8) +
+        annotate("text", x = (phases$art_start + art_end_x)/2, y = metrics$onart_setpoint,
+                 label = paste0("On-ART setpoint:\n", round(metrics$onart_setpoint, 0), " copies/mL"),
+                 hjust = 0.5, vjust = -0.5, color = "blue", size = 3.2)
+    }
+    
+    # Post-rebound setpoint (from ART end + 14 days to end of data)
+    if (!is.null(metrics$postrebound_setpoint) && !is.na(phases$art_end)) {
+      rebound_start <- phases$art_end + 14
+      if (rebound_start < max_x) {
+        gg <- gg +
+          geom_segment(x = rebound_start, xend = max_x,
+                       y = metrics$postrebound_setpoint, yend = metrics$postrebound_setpoint,
+                       linetype = "solid", color = "purple", linewidth = 0.6, alpha = 0.8) +
+          annotate("text", x = (rebound_start + max_x)/2, y = metrics$postrebound_setpoint,
+                   label = paste0("Post-rebound setpoint:\n", round(metrics$postrebound_setpoint, 0), " copies/mL"),
+                   hjust = 0.5, vjust = -0.5, color = "purple", size = 3.2)
+      }
+    }
+    
+    # Add ART blips highlighting
+    if (!is.null(metrics$onart_blips) && nrow(metrics$onart_blips$data) > 0) {
+      gg <- gg +
+        geom_point(data = metrics$onart_blips$data,
+                   aes(x = dpi, y = result), 
+                   color = "red", size = 3, alpha = 0.8, shape = 17)  # Triangle shape for blips
+    }
+    
+  } else {
+    # Non-ART pipeline - use segmentation-based phase-specific setpoints
+    if (!is.null(metrics$segmentation_raw) && !is.null(metrics$segmentation)) {
+      seg_data <- metrics$segmentation_raw$data
+      metrics$acute_phase_data <- metrics$acute_phase_data %>% mutate(dpi = timepostsivchallenge_dayspostinfection)
+  metrics$chronic_phase_data <- metrics$chronic_phase_data %>% mutate(dpi = timepostsivchallenge_dayspostinfection)
+  
+      # Use stored phase data if available for better accuracy
+      acute_data <- metrics$acute_phase_data
+      chronic_data <- metrics$chronic_phase_data
+      
+      # Acute phase setpoint line (span only acute phase region)
+      if (!is.null(metrics$acute_setpoint) && !is.null(acute_data) && nrow(acute_data) > 0) {
+        acute_dpi_range <- acute_data %>% 
+          summarise(min_dpi = min(dpi, na.rm = TRUE), max_dpi = max(dpi, na.rm = TRUE))
+        
+        if (!is.na(acute_dpi_range$min_dpi) && !is.na(acute_dpi_range$max_dpi)) {
+          gg <- gg +
+            geom_segment(x = acute_dpi_range$min_dpi, xend = acute_dpi_range$max_dpi,
+                         y = metrics$acute_setpoint, yend = metrics$acute_setpoint,
+                         linetype = "solid", color = "blue", linewidth = 0.6, alpha = 0.8) +
+            annotate("text", x = (acute_dpi_range$min_dpi + acute_dpi_range$max_dpi)/2, 
+                     y = metrics$acute_setpoint,
+                     label = paste0("Acute setpoint:\n", round(metrics$acute_setpoint, 0), " copies/mL"),
+                     hjust = 0.5, vjust = -0.5, color = "blue", size = 3.2)
+        }
+      }
+      
+      # Chronic phase setpoint line (span only chronic phase region)
+      if (!is.null(metrics$chronic_setpoint) && !is.null(chronic_data) && nrow(chronic_data) > 0) {
+        chronic_dpi_range <- chronic_data %>% 
+          summarise(min_dpi = min(dpi, na.rm = TRUE), max_dpi = max(dpi, na.rm = TRUE))
+        
+        if (!is.na(chronic_dpi_range$min_dpi) && !is.na(chronic_dpi_range$max_dpi)) {
+          gg <- gg +
+            geom_segment(x = chronic_dpi_range$min_dpi, xend = chronic_dpi_range$max_dpi,
+                         y = metrics$chronic_setpoint, yend = metrics$chronic_setpoint,
+                         linetype = "solid", color = "red", linewidth = 0.6, alpha = 0.8) +
+            annotate("text", x = (chronic_dpi_range$min_dpi + chronic_dpi_range$max_dpi)/2, 
+                     y = metrics$chronic_setpoint,
+                     label = paste0("Chronic setpoint:\n", round(metrics$chronic_setpoint, 0), " copies/mL"),
+                     hjust = 0.5, vjust = -0.5, color = "red", size = 3.2)
+        }
+      }
+      
+      # Add phase boundary vertical line
+      if (!is.null(metrics$phase_boundary)) {
+        gg <- gg +
+          geom_vline(xintercept = metrics$phase_boundary, linetype = "dashed", 
+                     color = "purple", linewidth = 0.8, alpha = 0.7) +
+          annotate("text", x = metrics$phase_boundary, y = min(df$result[df$result > 0], na.rm = TRUE),
+                   label = "Acute→Chronic", angle = 90, vjust = 1.2, hjust = 0, 
+                   color = "purple", size = 3)
+      }
+      
+      # Add segmentation coloring
+      df_with_seg <- df %>%
+        left_join(seg_data %>% select(date, state_label), by = "date")
+      
+      gg <- gg +
+        geom_point(data = df_with_seg %>% filter(!is.na(state_label)), 
+                   aes(color = state_label), size = 2.5, alpha = 0.8) +
+        labs(color = "Segmentation Phase") +
+        theme(legend.position = "bottom")
+    }
+  }
+  
+  # Add peak annotations (colored for ART subjects, orange for non-ART)
+  if (!is.null(metrics$acute_peak)) {
+    peak_color <- if (has_art) "darkorange" else "orange"
+    gg <- gg +
+      geom_point(x = metrics$acute_peak$day, y = metrics$acute_peak$value,
+                 shape = 23, fill = peak_color, color = "black", size = 4) +
+      annotate("text", x = metrics$acute_peak$day, y = metrics$acute_peak$value,
+               label = "Peak", vjust = -1.2, hjust = 0.5, size = 3.2, fontface = "bold")
+  }
+  
+  # Add only 1000 copies rebound point for ART subjects
+  if (has_art && !is.null(metrics$rebound_time_1000)) {
+    gg <- gg +
+      geom_point(x = metrics$rebound_time_1000$day, y = metrics$rebound_time_1000$value,
+                 shape = 21, fill = "red", color = "black", size = 3.5) +
+      annotate("text", x = metrics$rebound_time_1000$day, y = metrics$rebound_time_1000$value,
+               label = "Time to rebound\n(> 1000 copies)", vjust = -0.5, hjust = 0.5, 
+               size = 2.8, color = "red")
+  }
+  
+  # Add AUC shading for acute phase using stored original data
+  if (!is.null(metrics$acute_burden)) {
+    if (has_art && !is.null(metrics$phases$art_start)) {
+      # Use ART-defined acute phase
+      acute_data <- df %>% filter(dpi < metrics$phases$art_start, dpi >= 0) %>% arrange(dpi)
+    } else if (!has_art && !is.null(metrics$acute_phase_data)) {
+      # Use stored original acute phase data from proper mapping
+      acute_data <- metrics$acute_phase_data %>% arrange(dpi)
+    }
+    
+    if (exists("acute_data") && nrow(acute_data) >= 2) {
+      gg <- gg +
+        geom_area(data = acute_data, aes(x = dpi, y = result), 
+                  fill = "lightblue", alpha = 0.3, inherit.aes = FALSE)
+    }
+  }
+  
+  # Add LOD line (only lowest LOD)
+  min_lod <- min(df$lod, na.rm = TRUE)
+  gg <- gg +
+    geom_hline(yintercept = min_lod, linetype = "dotted", color = "darkred", alpha = 0.7) +
+    annotate("text", x = max(df$dpi, na.rm = TRUE), y = min_lod,
+             label = paste0("LOD (", min_lod, ")"), hjust = 1, vjust = -0.5, 
+             color = "darkred", size = 3)
+  
+  return(gg)
+}
+
+.GetData <- function(id = NULL) {
+  if (is.null(id)) {
+    stop("Please choose an ID for fetching pVL data.")
+  }
+    return(
+      labkey.selectRows( 
+        baseUrl="https://prime-seq.ohsu.edu",  
+        folderPath="/Labs/Bimber/Collaborations/SIV_Studies",  
+        schemaName="study",  
+        queryName="viralloads",     colSelect="Id,date,timePostSivChallenge/daysPostInfection,assayType,target,result,units,lod,dataSource,artInformation/daysPostArtInitiation,artInformation/daysPostArtRelease,timePostSivChallenge/infectionDate,artInformation/artInitiation,artInformation/artRelease",  
+      colSort="-artInformation/artInitiation,Id,-date",  
+      colFilter=makeFilter(c("sampleType", "EQUAL", "Plasma"), c("target", "EQUAL", "SIV"), c("Id", "EQUAL", id)),  
+      colNameOpt="rname"
+      )
+    )
+}
+
+# Main analysis function with pipeline routing
+Run <- function(ids = NULL) {
+  if (is.null(ids)) {
+    stop("Please provide one or more IDs to process.")
+  }
+
+  all_summaries <- list()
+  all_plots <- list()
+
+  for (id in ids) {
+    cat("Processing ID:", id, "\n")
+    
+    df <- tryCatch({
+      .GetData(id)
+    }, error = function(e) {
+      warning("Failed to fetch data for ID: ", id, ". Skipping.")
+      return(NULL)
+    })
+
+    if (is.null(df) || nrow(df) == 0) {
+      cat("No data found for ID:", id, "\n")
+      next
+    }
+
+    # Detect ART status and route to appropriate pipeline
+    has_art <- .DetectARTStatus(df)
+    cat("Subject", id, "- ART status:", has_art, "\n")
+    
+    if (has_art) {
+      # Run ART pipeline
+      result <- RunARTPipeline(df)
+      pipeline_type <- "ART"
+    } else {
+      # Run non-ART pipeline
+      result <- RunNoARTPipeline(df)
+      pipeline_type <- "No-ART"
+    }
+    
+    if (is.null(result) || nrow(result$summary) == 0) {
+      cat("Analysis failed for ID:", id, "\n")
+      next
+    }
+    
+    # Create unified plot
+    unified_plot <- CreateUnifiedTimeSeriesPlot(result$df, result$metrics, has_art)
+    
+    # Store results
+    all_summaries <- append(all_summaries, list(result$summary))
+    all_plots[[as.character(id)]] <- unified_plot
+    
+    cat("Completed", pipeline_type, "pipeline for ID:", id, 
+        "- Generated", nrow(result$summary), "metrics\n\n")
+  }
+
+  combined_summary <- dplyr::bind_rows(all_summaries)
+
+  return(list(
+    summary = combined_summary,
+    plots = all_plots
+  ))
+}
+
+UploadPVLOutcomes <- function(df) {
+  if (is.null(df) || nrow(df) == 0) {
+    stop("No rows to upload.")
+  }
+
+  df <- dplyr::rename(df, dataSource = datasource)
+  
+  required_cols <- c("id", "date", "outcome", "numericValue", "stringValue", "comments", "dataSource")
+  missing_cols <- setdiff(required_cols, names(df))
+  if (length(missing_cols) > 0) {
+    stop("Missing required columns in df: ", paste(missing_cols, collapse = ", "))
+  }
+
+  upload_df <- df %>%
+    dplyr::transmute(
+      Id = id,
+      date = as.character(date),
+      outcome = outcome,
+      numeric_value = numericValue,
+      string_value = stringValue,
+      comments = comments,
+      dataSource = dataSource
+    )
+
+  Rlabkey::labkey.insertRows(
+    baseUrl = "https://prime-seq.ohsu.edu",
+    folderPath = "/Labs/Bimber/Collaborations/SIV_Studies",
+    schemaName = "study",
+    queryName = "pvl_outcomes",
+    toInsert = upload_df
+  )
+
+  message("Uploaded ", nrow(upload_df), " rows to pvl_outcomes.")
+}
+
+RunAndSaveImages <- function(ids = NULL, folder_path = NULL) {
+  if (is.null(ids)) stop("You must provide a vector of ids.")
+  if (is.null(folder_path)) stop("You must provide a folder path.")
+  if (!dir.exists(folder_path)) dir.create(folder_path, recursive = TRUE)
+
+  all_tables <- list()
+
+  for (id in ids) {
+    message("Processing ID: ", id)
+    res <- Run(id)
+    
+    summary_with_id <- res$summary
+    summary_with_id$id <- id
+    all_tables[[id]] <- summary_with_id
+
+    # Save the unified plot for this subject
+    if (!is.null(res$plots[[as.character(id)]])) {
+      unified_plot <- res$plots[[as.character(id)]] +
+        theme(plot.background = element_rect(color = "black", size = 1))
+      
+      file_path <- file.path(folder_path, paste0("pvl_", id, ".png"))
+      ggsave(filename = file_path, plot = unified_plot, width = 12, height = 8, dpi = 300)
+      message("Saved plot for ID ", id, " to ", file_path)
+    }
+  }
+
+  combined_table <- dplyr::bind_rows(all_tables)
+  return(combined_table)
+}
+
+ids <- c(17062, 19309)  # Replace with actual IDs
+df <- RunAndSaveImages(ids = ids, folder_path = "pvl_figs_wide")
+primeseq_res <- UploadPVLOutcomes(df)
+
+# Test individual functions:
+test_no_art <- Run(18769)  # Replace with an ID that has ART
+test_art <- Run(31443)  # Replace with an ID that doesn't have ART
+test <- Run(c(18769, 18821, 18898, 26537, 27307, 31262, 31443, 31883, 32388))
+# test_art$plots[["17062"]]
+# test_no_art$plots[["19309"]]
+```
+>>>>>>> Stashed changes
