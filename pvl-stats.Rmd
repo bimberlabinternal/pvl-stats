@@ -371,9 +371,11 @@ RunARTPipeline <- function(df) {
     computed_metrics$onart_setpoint <- onart_setpoint
   }
   
-  # 4. On-ART Blip Frequency
+  # 4. On-ART Blip Frequency - improved detection
+  # Use the lowest LOD value during on-ART period for consistent threshold
+  lod_threshold <- min(onart_df$lod, na.rm = TRUE)
   onart_blips <- onart_df %>% 
-    filter(!is.na(result), !is.na(lod), result > lod)
+    filter(!is.na(result), result > lod_threshold)  # Any value above LOD threshold
   blip_count <- nrow(onart_blips)
   
   if (blip_count > 0) {
@@ -381,7 +383,7 @@ RunARTPipeline <- function(df) {
       .AppendSummaryRow(id, date, "onArtBlipCount", numeric_value = blip_count, data_source = data_source)
     ))
   }
-  computed_metrics$onart_blips <- list(count = blip_count, data = onart_blips)
+  computed_metrics$onart_blips <- list(count = blip_count, data = onart_blips, lod_threshold = lod_threshold)
   
   # 5. Time to Rebound and Post-Rebound Setpoint (only if ART release exists)
   if (!is.na(art_end) && nrow(postrebound_df) > 0) {
@@ -728,10 +730,10 @@ CreateUnifiedTimeSeriesPlot <- function(df, metrics, has_art = FALSE) {
   if (has_art && !is.null(metrics$phases)) {
     phases <- metrics$phases
     
-    # Acute phase setpoint (from 0 to ART start)
+    # Acute phase setpoint (from 0 to ART start only)
     if (!is.null(metrics$acute_setpoint) && !is.na(phases$art_start)) {
       gg <- gg +
-        geom_segment(x = 0, xend = max_x,
+        geom_segment(x = 0, xend = phases$art_start,
                      y = metrics$acute_setpoint, yend = metrics$acute_setpoint,
                      linetype = "solid", color = "orange", linewidth = 0.6, alpha = 0.8) +
         annotate("text", x = phases$art_start/2, y = metrics$acute_setpoint,
@@ -743,7 +745,7 @@ CreateUnifiedTimeSeriesPlot <- function(df, metrics, has_art = FALSE) {
     if (!is.null(metrics$onart_setpoint)) {
       art_end_x <- if (!is.na(phases$art_end)) phases$art_end else max(df$dpi, na.rm = TRUE)
       gg <- gg +
-        geom_segment(x = phases$art_start, xend = max_x,
+        geom_segment(x = phases$art_start, xend = art_end_x,
                      y = metrics$onart_setpoint, yend = metrics$onart_setpoint,
                      linetype = "solid", color = "blue", linewidth = 0.6, alpha = 0.8) +
         annotate("text", x = (phases$art_start + art_end_x)/2, y = metrics$onart_setpoint,
@@ -777,9 +779,22 @@ CreateUnifiedTimeSeriesPlot <- function(df, metrics, has_art = FALSE) {
     # Non-ART pipeline - use segmentation-based phase-specific setpoints
     if (!is.null(metrics$segmentation_raw) && !is.null(metrics$segmentation)) {
       seg_data <- metrics$segmentation_raw$data
-      metrics$acute_phase_data <- metrics$acute_phase_data %>% mutate(dpi = timepostsivchallenge_dayspostinfection)
-  metrics$chronic_phase_data <- metrics$chronic_phase_data %>% mutate(dpi = timepostsivchallenge_dayspostinfection)
-  
+      
+      # Fix potential issue with dpi column
+      if (!is.null(metrics$acute_phase_data)) {
+        if (!"dpi" %in% colnames(metrics$acute_phase_data)) {
+          metrics$acute_phase_data <- metrics$acute_phase_data %>% 
+            mutate(dpi = timepostsivchallenge_dayspostinfection)
+        }
+      }
+      
+      if (!is.null(metrics$chronic_phase_data)) {
+        if (!"dpi" %in% colnames(metrics$chronic_phase_data)) {
+          metrics$chronic_phase_data <- metrics$chronic_phase_data %>% 
+            mutate(dpi = timepostsivchallenge_dayspostinfection)
+        }
+      }
+      
       # Use stored phase data if available for better accuracy
       acute_data <- metrics$acute_phase_data
       chronic_data <- metrics$chronic_phase_data
@@ -828,15 +843,23 @@ CreateUnifiedTimeSeriesPlot <- function(df, metrics, has_art = FALSE) {
                    color = "purple", size = 3)
       }
       
-      # Add segmentation coloring
+      # Add segmentation coloring but avoid final dot highlighting
       df_with_seg <- df %>%
         left_join(seg_data %>% select(date, state_label), by = "date")
       
-      gg <- gg +
-        geom_point(data = df_with_seg %>% filter(!is.na(state_label)), 
-                   aes(color = state_label), size = 2.5, alpha = 0.8) +
-        labs(color = "Segmentation Phase") +
-        theme(legend.position = "bottom")
+      # Filter out the final point to avoid inappropriate highlighting
+      seg_colored_points <- df_with_seg %>% 
+        filter(!is.na(state_label)) %>%
+        arrange(dpi) %>%
+        slice(1:(n()-1))  # Remove last point
+      
+      if (nrow(seg_colored_points) > 0) {
+        gg <- gg +
+          geom_point(data = seg_colored_points, 
+                     aes(color = state_label), size = 2.5, alpha = 0.8) +
+          labs(color = "Segmentation Phase") +
+          theme(legend.position = "bottom")
+      }
     }
   }
   
@@ -847,10 +870,20 @@ CreateUnifiedTimeSeriesPlot <- function(df, metrics, has_art = FALSE) {
       geom_point(x = metrics$acute_peak$day, y = metrics$acute_peak$value,
                  shape = 23, fill = peak_color, color = "black", size = 4) +
       annotate("text", x = metrics$acute_peak$day, y = metrics$acute_peak$value,
-               label = "Peak", vjust = -1.2, hjust = 0.5, size = 3.2, fontface = "bold")
+               label = "Acute phase peak", vjust = -1.2, hjust = 0.5, size = 3.2, fontface = "bold")
   }
   
-  # Add only 1000 copies rebound point for ART subjects
+  # Add LOD rebound point for ART subjects (primary rebound marker)
+  if (has_art && !is.null(metrics$rebound_time_lod)) {
+    gg <- gg +
+      geom_point(x = metrics$rebound_time_lod$day, y = metrics$rebound_time_lod$value,
+                 shape = 21, fill = "darkgreen", color = "black", size = 3.5) +
+      annotate("text", x = metrics$rebound_time_lod$day, y = metrics$rebound_time_lod$value,
+               label = "Time to rebound\n(> LOD)", vjust = -0.5, hjust = 0.5, 
+               size = 2.8, color = "darkgreen")
+  }
+  
+  # Add 1000 copies rebound point for ART subjects (secondary marker)
   if (has_art && !is.null(metrics$rebound_time_1000)) {
     gg <- gg +
       geom_point(x = metrics$rebound_time_1000$day, y = metrics$rebound_time_1000$value,
@@ -1043,4 +1076,3 @@ test <- Run(c(18769, 18821, 18898, 26537, 27307, 31262, 31443, 31883, 32388))
 # test_art$plots[["17062"]]
 # test_no_art$plots[["19309"]]
 ```
->>>>>>> Stashed changes
