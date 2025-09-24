@@ -220,11 +220,6 @@ Rdiscvr::SetLabKeyDefaults(baseUrl = 'https://prime-seq.ohsu.edu', defaultFolder
       color <- colors[min(i, length(colors))]
       
       gg <- gg + 
-        geom_hline(yintercept = setpoint_info$setpoint, 
-                   linetype = "solid", 
-                   color = color, 
-                   linewidth = 0.6, 
-                   alpha = 0.8) +
         annotate("text", 
                  x = min(data_df$date, na.rm = TRUE),
                  y = setpoint_info$setpoint,
@@ -249,7 +244,7 @@ Rdiscvr::SetLabKeyDefaults(baseUrl = 'https://prime-seq.ohsu.edu', defaultFolder
   return(gg)
 }
 
-.AppendSummaryRow <- function(id, date, outcome, numeric_value = NA, string_value = NA, comment = NA, data_source = NA) {
+.AppendSummaryRow <- function(id, date, outcome, numeric_value = NA, string_value = NA, comment = NA, data_source = NA, window_start = NA, window_end = NA) {
   if (is.na(numeric_value) && is.na(string_value)) {
     return(NULL)
   }
@@ -261,7 +256,9 @@ Rdiscvr::SetLabKeyDefaults(baseUrl = 'https://prime-seq.ohsu.edu', defaultFolder
     numericValue = numeric_value,
     stringValue = string_value,
     comments = comment,
-    datasource = data_source
+    datasource = data_source,
+    windowStart = window_start,
+    windowEnd = window_end
   )
 }
 
@@ -286,7 +283,7 @@ Rdiscvr::SetLabKeyDefaults(baseUrl = 'https://prime-seq.ohsu.edu', defaultFolder
 # - Acute phase: infection to ART initiation
 # - On-ART phase: ART initiation to ART release
 # - Post-rebound phase: ART release onwards
-RunARTPipeline <- function(df) {
+RunARTPipeline <- function(df, acute_window = 21) {
   if (is.null(df) || nrow(df) == 0) {
     warning("Input dataframe is NULL or empty")
     return(list(df = df, summary = tibble(), metrics = list()))
@@ -318,8 +315,8 @@ RunARTPipeline <- function(df) {
   art_end <- if (length(art_end) > 0) art_end[1] else NA
   
   # Phase-specific data
-  acute_df <- df %>% filter(dpi < art_start, dpi >= 0)
-  onart_df <- df %>% filter(dpi >= art_start, if (!is.na(art_end)) dpi <= art_end else TRUE)
+  acute_df <- df %>% filter(dpi < (art_start + acute_window), dpi >= 0)
+  onart_df <- df %>% filter(dpi >= (art_start + acute_window), if (!is.na(art_end)) dpi <= art_end else TRUE)
   postrebound_df <- if (!is.na(art_end)) df %>% filter(dpi > art_end) else tibble()
   
   # Store phase information
@@ -338,10 +335,15 @@ RunARTPipeline <- function(df) {
     # Acute phase setpoint (geometric mean of acute phase)
     acute_setpoint <- exp(mean(log(acute_df$result)))
     
+    # Get window dates for acute phase
+    acute_window_start <- min(acute_df$date, na.rm = TRUE)
+    acute_window_end <- max(acute_df$date, na.rm = TRUE)
+    
     summary_outcomes <- append(summary_outcomes, list(
       .AppendSummaryRow(id, date, "acutePhasePeak_pVL", numeric_value = acute_peak, data_source = data_source),
       .AppendSummaryRow(id, date, "acutePhasePeak_day", numeric_value = acute_peak_day, data_source = data_source),
-      .AppendSummaryRow(id, date, "acutePhaseSetpoint", numeric_value = acute_setpoint, data_source = data_source)
+      .AppendSummaryRow(id, date, "acutePhaseSetpoint", numeric_value = acute_setpoint, data_source = data_source, 
+                        window_start = acute_window_start, window_end = acute_window_end)
     ))
     
     computed_metrics$acute_peak <- list(value = acute_peak, day = acute_peak_day)
@@ -353,8 +355,13 @@ RunARTPipeline <- function(df) {
     acute_df_sorted <- acute_df %>% arrange(dpi)
     auc <- trapz(acute_df_sorted$dpi, acute_df_sorted$result)
     
+    # Get window dates for acute phase burden (same as acute setpoint)
+    acute_burden_window_start <- min(acute_df_sorted$date, na.rm = TRUE)
+    acute_burden_window_end <- max(acute_df_sorted$date, na.rm = TRUE)
+    
     summary_outcomes <- append(summary_outcomes, list(
-      .AppendSummaryRow(id, date, "acutePhaseBurden", numeric_value = auc, data_source = data_source)
+      .AppendSummaryRow(id, date, "acutePhaseBurden", numeric_value = auc, data_source = data_source,
+                        window_start = acute_burden_window_start, window_end = acute_burden_window_end)
     ))
     
     computed_metrics$acute_burden <- auc
@@ -364,8 +371,13 @@ RunARTPipeline <- function(df) {
   if (nrow(onart_df) >= 3) {
     onart_setpoint <- exp(mean(log(onart_df$result)))
     
+    # Get window dates for on-ART setpoint
+    onart_setpoint_window_start <- min(onart_df$date, na.rm = TRUE)
+    onart_setpoint_window_end <- max(onart_df$date, na.rm = TRUE)
+    
     summary_outcomes <- append(summary_outcomes, list(
-      .AppendSummaryRow(id, date, "onArtSetpoint", numeric_value = onart_setpoint, data_source = data_source)
+      .AppendSummaryRow(id, date, "onArtSetpoint", numeric_value = onart_setpoint, data_source = data_source,
+                        window_start = onart_setpoint_window_start, window_end = onart_setpoint_window_end)
     ))
     
     computed_metrics$onart_setpoint <- onart_setpoint
@@ -379,8 +391,13 @@ RunARTPipeline <- function(df) {
   blip_count <- nrow(onart_blips)
   
   if (blip_count > 0) {
+    # Get window dates for onArtBlipCount (same as on-ART period)
+    onart_blip_window_start <- min(onart_df$date, na.rm = TRUE)
+    onart_blip_window_end <- max(onart_df$date, na.rm = TRUE)
+    
     summary_outcomes <- append(summary_outcomes, list(
-      .AppendSummaryRow(id, date, "onArtBlipCount", numeric_value = blip_count, data_source = data_source)
+      .AppendSummaryRow(id, date, "onArtBlipCount", numeric_value = blip_count, data_source = data_source,
+                        window_start = onart_blip_window_start, window_end = onart_blip_window_end)
     ))
   }
   computed_metrics$onart_blips <- list(count = blip_count, data = onart_blips, lod_threshold = lod_threshold)
@@ -434,8 +451,12 @@ RunARTPipeline <- function(df) {
     if (nrow(postrebound_setpoint_df) >= 3) {
       postrebound_setpoint <- exp(mean(log(postrebound_setpoint_df$result)))
       
+      postrebound_window_start <- min(postrebound_setpoint_df$date, na.rm = TRUE)
+      postrebound_window_end <- max(postrebound_setpoint_df$date, na.rm = TRUE)
+      
       summary_outcomes <- append(summary_outcomes, list(
-        .AppendSummaryRow(id, date, "postReboundSetpoint", numeric_value = postrebound_setpoint, data_source = data_source)
+        .AppendSummaryRow(id, date, "postReboundSetpoint", numeric_value = postrebound_setpoint, data_source = data_source,
+                          window_start = postrebound_window_start, window_end = postrebound_window_end)
       ))
       
       computed_metrics$postrebound_setpoint <- postrebound_setpoint
@@ -517,8 +538,11 @@ RunNoARTPipeline <- function(df) {
     # Rank 1 setpoint (acute phase)
     rank1_setpoint <- setpoint_analysis$setpoints %>% filter(rank == 1) %>% pull(setpoint)
     if (length(rank1_setpoint) > 0) {
+      acute_window_start <- min(acute_df$date, na.rm = TRUE)
+      acute_window_end <- max(acute_df$date, na.rm = TRUE)
       summary_outcomes <- append(summary_outcomes, list(
-        .AppendSummaryRow(id, date, "acutePhaseSetpoint", numeric_value = rank1_setpoint[1], data_source = data_source)
+        .AppendSummaryRow(id, date, "acutePhaseSetpoint", numeric_value = rank1_setpoint[1], data_source = data_source,
+                          window_start = acute_window_start, window_end = acute_window_end)
       ))
       computed_metrics$acute_setpoint <- rank1_setpoint[1]
     }
@@ -526,8 +550,11 @@ RunNoARTPipeline <- function(df) {
     # Rank 2 setpoint (chronic/latent phase)
     rank2_setpoint <- setpoint_analysis$setpoints %>% filter(rank == 2) %>% pull(setpoint)
     if (length(rank2_setpoint) > 0) {
+      chronic_window_start <- min(chronic_df$date, na.rm = TRUE)
+      chronic_window_end <- max(chronic_df$date, na.rm = TRUE)
       summary_outcomes <- append(summary_outcomes, list(
-        .AppendSummaryRow(id, date, "chronicPhaseSetpoint", numeric_value = rank2_setpoint[1], data_source = data_source)
+        .AppendSummaryRow(id, date, "chronicPhaseSetpoint", numeric_value = rank2_setpoint[1], data_source = data_source,
+                          window_start = chronic_window_start, window_end = chronic_window_end)
       ))
       computed_metrics$chronic_setpoint <- rank2_setpoint[1]
     }
@@ -674,7 +701,7 @@ RunNoARTPipeline <- function(df) {
 #
 # Generates a single comprehensive plot showing all computed metrics
 # Uses days post infection as x-axis and includes all relevant annotations
-CreateUnifiedTimeSeriesPlot <- function(df, metrics, has_art = FALSE) {
+CreateUnifiedTimeSeriesPlot <- function(df, metrics, has_art = FALSE, skip_outcome_annotations = FALSE, art_acute_window = 21) {
   if (is.null(df) || nrow(df) == 0) {
     return(ggplot() + 
            theme_void() + 
@@ -733,9 +760,6 @@ CreateUnifiedTimeSeriesPlot <- function(df, metrics, has_art = FALSE) {
     # Acute phase setpoint (from 0 to ART start only)
     if (!is.null(metrics$acute_setpoint) && !is.na(phases$art_start)) {
       gg <- gg +
-        geom_segment(x = 0, xend = phases$art_start,
-                     y = metrics$acute_setpoint, yend = metrics$acute_setpoint,
-                     linetype = "solid", color = "orange", linewidth = 0.6, alpha = 0.8) +
         annotate("text", x = phases$art_start/2, y = metrics$acute_setpoint,
                  label = paste0("Acute setpoint:\n", round(metrics$acute_setpoint, 0), " copies/mL"),
                  hjust = 0.5, vjust = -0.5, color = "orange", size = 3.2)
@@ -745,9 +769,6 @@ CreateUnifiedTimeSeriesPlot <- function(df, metrics, has_art = FALSE) {
     if (!is.null(metrics$onart_setpoint)) {
       art_end_x <- if (!is.na(phases$art_end)) phases$art_end else max(df$dpi, na.rm = TRUE)
       gg <- gg +
-        geom_segment(x = phases$art_start, xend = art_end_x,
-                     y = metrics$onart_setpoint, yend = metrics$onart_setpoint,
-                     linetype = "solid", color = "blue", linewidth = 0.6, alpha = 0.8) +
         annotate("text", x = (phases$art_start + art_end_x)/2, y = metrics$onart_setpoint,
                  label = paste0("On-ART setpoint:\n", round(metrics$onart_setpoint, 0), " copies/mL"),
                  hjust = 0.5, vjust = -0.5, color = "blue", size = 3.2)
@@ -758,9 +779,6 @@ CreateUnifiedTimeSeriesPlot <- function(df, metrics, has_art = FALSE) {
       rebound_start <- phases$art_end + 14
       if (rebound_start < max_x) {
         gg <- gg +
-          geom_segment(x = rebound_start, xend = max_x,
-                       y = metrics$postrebound_setpoint, yend = metrics$postrebound_setpoint,
-                       linetype = "solid", color = "purple", linewidth = 0.6, alpha = 0.8) +
           annotate("text", x = (rebound_start + max_x)/2, y = metrics$postrebound_setpoint,
                    label = paste0("Post-rebound setpoint:\n", round(metrics$postrebound_setpoint, 0), " copies/mL"),
                    hjust = 0.5, vjust = -0.5, color = "purple", size = 3.2)
@@ -806,9 +824,6 @@ CreateUnifiedTimeSeriesPlot <- function(df, metrics, has_art = FALSE) {
         
         if (!is.na(acute_dpi_range$min_dpi) && !is.na(acute_dpi_range$max_dpi)) {
           gg <- gg +
-            geom_segment(x = acute_dpi_range$min_dpi, xend = acute_dpi_range$max_dpi,
-                         y = metrics$acute_setpoint, yend = metrics$acute_setpoint,
-                         linetype = "solid", color = "blue", linewidth = 0.6, alpha = 0.8) +
             annotate("text", x = (acute_dpi_range$min_dpi + acute_dpi_range$max_dpi)/2, 
                      y = metrics$acute_setpoint,
                      label = paste0("Acute setpoint:\n", round(metrics$acute_setpoint, 0), " copies/mL"),
@@ -823,9 +838,6 @@ CreateUnifiedTimeSeriesPlot <- function(df, metrics, has_art = FALSE) {
         
         if (!is.na(chronic_dpi_range$min_dpi) && !is.na(chronic_dpi_range$max_dpi)) {
           gg <- gg +
-            geom_segment(x = chronic_dpi_range$min_dpi, xend = chronic_dpi_range$max_dpi,
-                         y = metrics$chronic_setpoint, yend = metrics$chronic_setpoint,
-                         linetype = "solid", color = "red", linewidth = 0.6, alpha = 0.8) +
             annotate("text", x = (chronic_dpi_range$min_dpi + chronic_dpi_range$max_dpi)/2, 
                      y = metrics$chronic_setpoint,
                      label = paste0("Chronic setpoint:\n", round(metrics$chronic_setpoint, 0), " copies/mL"),
@@ -841,24 +853,6 @@ CreateUnifiedTimeSeriesPlot <- function(df, metrics, has_art = FALSE) {
           annotate("text", x = metrics$phase_boundary, y = min(df$result[df$result > 0], na.rm = TRUE),
                    label = "Acute→Chronic", angle = 90, vjust = 1.2, hjust = 0, 
                    color = "purple", size = 3)
-      }
-      
-      # Add segmentation coloring but avoid final dot highlighting
-      df_with_seg <- df %>%
-        left_join(seg_data %>% select(date, state_label), by = "date")
-      
-      # Filter out the final point to avoid inappropriate highlighting
-      seg_colored_points <- df_with_seg %>% 
-        filter(!is.na(state_label)) %>%
-        arrange(dpi) %>%
-        slice(1:(n()-1))  # Remove last point
-      
-      if (nrow(seg_colored_points) > 0) {
-        gg <- gg +
-          geom_point(data = seg_colored_points, 
-                     aes(color = state_label), size = 2.5, alpha = 0.8) +
-          labs(color = "Segmentation Phase") +
-          theme(legend.position = "bottom")
       }
     }
   }
@@ -897,7 +891,7 @@ CreateUnifiedTimeSeriesPlot <- function(df, metrics, has_art = FALSE) {
   if (!is.null(metrics$acute_burden)) {
     if (has_art && !is.null(metrics$phases$art_start)) {
       # Use ART-defined acute phase
-      acute_data <- df %>% filter(dpi < metrics$phases$art_start, dpi >= 0) %>% arrange(dpi)
+      acute_data <- df %>% filter(dpi < (metrics$phases$art_start + art_acute_window), dpi >= 0) %>% arrange(dpi)
     } else if (!has_art && !is.null(metrics$acute_phase_data)) {
       # Use stored original acute phase data from proper mapping
       acute_data <- metrics$acute_phase_data %>% arrange(dpi)
@@ -1075,4 +1069,104 @@ test_art <- Run(31443)  # Replace with an ID that doesn't have ART
 test <- Run(c(18769, 18821, 18898, 26537, 27307, 31262, 31443, 31883, 32388))
 # test_art$plots[["17062"]]
 # test_no_art$plots[["19309"]]
+
+
+ggplot(
+    pvl_data[
+        pvl_data$timepostsivchallenge_dayspostinfection >= 0 &
+            pvl_data$timepostsivchallenge_dayspostinfection <= 1000, ],
+    aes(
+        x = timepostsivchallenge_dayspostinfection,
+        y = result,
+        group = id
+    )
+) +
+    geom_line(size = 1, alpha = 0.1) +
+    scale_y_log10(
+        breaks = c(1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7),
+        labels = scales::comma_format()
+    ) +
+    labs(
+        title = "SIV Plasma Viral Load Over Time",
+        x = "Days Post Infection",
+        y = "Plasma Viral Load (copies/mL)",
+        color = "Animal ID"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        legend.position = "right",
+        panel.grid.minor = element_blank()
+    )
+
+
+df <- labkey.data %>%
+  mutate(
+    version      = if_else(str_ends(outcome, "_dynamic"), "dynamic", "static"),
+    outcome_base = str_remove(outcome, "_dynamic$"),
+    numeric_value = suppressWarnings(as.numeric(numeric_value))
+  ) %>%
+  filter(!is.na(numeric_value)) %>%
+  # keep only outcome_bases that have both static and dynamic present
+  group_by(outcome_base) %>%
+  filter(all(c("static","dynamic") %in% unique(version))) %>%
+  ungroup()
+
+#--- 2) Remove *upper-tail* outliers per (base × version) ---------------------
+df_filt <- df %>%
+  group_by(outcome_base, version) %>%
+  mutate(
+    Q1    = quantile(numeric_value, 0.25, na.rm = TRUE),
+    Q3    = quantile(numeric_value, 0.75, na.rm = TRUE),
+    IQRv  = Q3 - Q1,
+    upper = Q3 + 1.5 * IQRv
+  ) %>%
+  ungroup() %>%
+  filter(numeric_value <= upper | is.na(upper)) %>%
+  select(-Q1, -Q3, -IQRv, -upper)
+
+#--- 3) Helper: build Q–Q points (actual values) for one outcome_base ---------
+qq_df_for_outcome <- function(dat) {
+  x <- dat %>% filter(version == "static")  %>% pull(numeric_value)
+  y <- dat %>% filter(version == "dynamic") %>% pull(numeric_value)
+  if (length(x) < 2 || length(y) < 2) return(NULL)
+
+  # common probs based on the smaller sample; use sample quantiles (type=7)
+  n     <- min(length(x), length(y))
+  probs <- (1:n) / (n + 1)
+
+  tibble(
+    outcome_base = dat$outcome_base[1],
+    prob         = probs,
+    x_static     = as.numeric(quantile(x, probs, type = 7, names = FALSE, na.rm = TRUE)),
+    y_dynamic    = as.numeric(quantile(y, probs, type = 7, names = FALSE, na.rm = TRUE)),
+    n_static     = length(x),
+    n_dynamic    = length(y)
+  )
+}
+
+#--- 4) Compute all Q–Q points ------------------------------------------------
+qq_points <- df_filt %>%
+  group_by(outcome_base) %>%
+  group_modify(~qq_df_for_outcome(.x)) %>%
+  ungroup()
+
+# Inspect the actual plotted values (these are the axes values in the plots)
+# head(qq_points)
+
+#--- 5) One plot per outcome_base ---------------------------------------------
+plots <- qq_points %>%
+  group_split(outcome_base) %>%
+  map(function(d) {
+    ob <- unique(d$outcome_base)
+    ggplot(d, aes(x = x_static, y = y_dynamic)) +
+      geom_point(alpha = 0.7) +
+      geom_abline(intercept = 0, slope = 1, linetype = "dashed") +
+      labs(
+        title = paste0("Q–Q: ", ob),
+        x = "Static window",
+        y = "Dynamic window"
+      ) +
+      theme_minimal(base_size = 12)
+  })
 ```

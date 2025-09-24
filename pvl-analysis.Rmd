@@ -1,0 +1,1486 @@
+---
+title: "pvl-analysis.Rmd"
+output: html_document
+date: "2025-08-20"
+---
+
+```{r setup, include=FALSE}
+library(Rdiscvr)
+library(dplyr)
+library(Rlabkey)
+library(forecast)
+library(scales)
+library(pracma)
+library(ggplot2)
+library(patchwork)
+library(officer)
+```
+
+```{r}
+pvl_outcomes <- labkey.selectRows(
+    baseUrl="https://prime-seq.ohsu.edu", 
+    folderPath="/Labs/Bimber/Collaborations/SIV_Studies", 
+    schemaName="study", 
+    queryName="pvl_outcomes", 
+    viewName="", 
+    colSelect="Id,date,outcome,numeric_value,string_value,comments,dataSource", 
+    colSort="Id,-outcome", 
+    colFilter=NULL, 
+    containerFilter=NULL, 
+    colNameOpt="rname"
+)
+
+pvls_raw <- labkey.selectRows(
+    baseUrl="https://prime-seq.ohsu.edu", 
+    folderPath="/Labs/Bimber/Collaborations/SIV_Studies", 
+    schemaName="study", 
+    queryName="viralloads", 
+    viewName="", 
+    colSelect="Id,date,timePostSivChallenge/daysPostInfection,sampleType,assayType,target,result,units,lod,dataSource,artInformation/daysPostArtInitiation,artInformation/daysPostArtRelease", 
+    colSort="Id,-date", 
+    colFilter=NULL, 
+    containerFilter=NULL, 
+    colNameOpt="rname"
+)
+
+mhc_ids <- as.vector(labkey.data <- labkey.selectRows(
+    baseUrl="https://prime-seq.ohsu.edu", 
+    folderPath="/Labs/Bimber/Collaborations/SIV_Studies", 
+    schemaName="study", 
+    queryName="Demographics", 
+    viewName="", 
+    colSelect="Id,sex,species,geographic_origin,calculated_status,birth,death,projects/allStudies,projects/subgroups,immunizations/immunizations,outcomes/outcomes", 
+    colSort="mhcGenotypes/assayTypes,Id,Id", 
+    colFilter=makeFilter(c("projects/subgroups", "CONTAINS", "control"),c("sivART/allART", "NOT_MISSING", "")), 
+    containerFilter=NULL, 
+    colNameOpt="rname"
+))
+
+project_assignment <- labkey.selectRows(
+    baseUrl="https://prime-seq.ohsu.edu", 
+    folderPath="/Labs/Bimber/Collaborations/SIV_Studies", 
+    schemaName="study", 
+    queryName="assignment", 
+    viewName="", 
+    colSelect="Id,date,enddate,study,subgroup,cohortId,category,dataSource", 
+    colSort="Id", 
+    colFilter=NULL, 
+    containerFilter=NULL, 
+    colNameOpt="rname"
+)
+```
+
+```{r}
+MakePVLOutcomeFigures_AllIds <- function(pvls_raw, pvl_outcomes, project_assignment,
+                                         ids = NULL,
+                                         start_date = as.Date('2010-01-01'),
+                                         end_date   = as.Date('2025-12-30'),
+                                         legend_rows = 5,
+                                         pvl_title = "all IDs") {
+  # Map outcomes -> study (by id & interval) for the barplots
+assign_study_to_outcomes <- function(outdf, pa_df) {
+  pa2 <- pa_df %>%
+    dplyr::mutate(enddate = dplyr::coalesce(enddate, date)) %>%
+    dplyr::filter(!is.na(date))
+
+  # If no outcomes at all, return with a length-0 column
+  if (nrow(outdf) == 0) {
+    outdf$study_assigned <- character(0)
+    return(outdf)
+  }
+
+  # If there is data but no assignments, mark all as Unassigned
+  if (nrow(pa2) == 0) {
+    outdf$study_assigned <- rep("Unassigned", nrow(outdf))
+    return(outdf)
+  }
+
+  outdf$date <- as.Date(outdf$date)
+  outdf %>%
+    dplyr::group_by(id) %>%
+    dplyr::group_modify(function(rows, key) {
+      pa_i <- pa2 %>% dplyr::filter(id == key$id[1])
+      if (nrow(pa_i) == 0) {
+        rows$study_assigned <- rep("Unassigned", nrow(rows))
+        return(rows)
+      }
+      rows$study_assigned <- vapply(rows$date, function(d) {
+        hits <- pa_i %>% dplyr::filter(date <= d, enddate >= d)
+        if (nrow(hits) == 0) "Unassigned"
+        else hits$study[which.max(hits$enddate - hits$date)][1]
+      }, character(1))
+      rows
+    }) %>%
+    dplyr::ungroup() %>%
+    dplyr::mutate(study_assigned = .clean_study(study_assigned))
+}
+
+# Map pVL rows -> study (by id & interval) for study box heights
+assign_study_to_pvls <- function(pvls_df, pa_df) {
+  pa2 <- pa_df %>%
+    dplyr::mutate(enddate = dplyr::coalesce(enddate, date)) %>%
+    dplyr::filter(!is.na(date))
+
+  # If no pVL rows, return with length-0 column (or all NA if there are rows but no PA)
+  if (nrow(pvls_df) == 0) {
+    pvls_df$study_assigned <- character(0)
+    return(pvls_df)
+  }
+
+  if (nrow(pa2) == 0) {
+    pvls_df$study_assigned <- rep(NA_character_, nrow(pvls_df))
+    return(pvls_df)
+  }
+
+  pvls_df$date <- as.Date(pvls_df$date)
+  pvls_df %>%
+    dplyr::group_by(id) %>%
+    dplyr::group_modify(function(rows, key) {
+      pa_i <- pa2 %>% dplyr::filter(id == key$id[1])
+      if (nrow(pa_i) == 0) {
+        rows$study_assigned <- rep(NA_character_, nrow(rows))
+        return(rows)
+      }
+      rows$study_assigned <- vapply(rows$date, function(d) {
+        hits <- pa_i %>% dplyr::filter(date <= d, enddate >= d)
+        if (nrow(hits) == 0) NA_character_
+        else hits$study[which.max(hits$enddate - hits$date)][1]
+      }, character(1))
+      rows
+    }) %>%
+    dplyr::ungroup() %>%
+    dplyr::mutate(study_assigned = .clean_study(study_assigned))
+}
+
+  # ---------------- Normalize & checks ----------------
+  names(pvls_raw)            <- tolower(names(pvls_raw))
+  names(pvl_outcomes)        <- tolower(names(pvl_outcomes))
+  names(project_assignment)  <- tolower(names(project_assignment))
+
+  stopifnot(all(c("id","date","result") %in% names(pvls_raw)))
+  stopifnot(all(c("id","date","outcome","numeric_value") %in% names(pvl_outcomes)))
+  stopifnot(all(c("id","date","enddate","study") %in% names(project_assignment)))
+
+  # Ensure date types
+  pvls_raw$date              <- as.Date(pvls_raw$date)
+  pvl_outcomes$date          <- as.Date(pvl_outcomes$date)
+  project_assignment$date    <- as.Date(project_assignment$date)
+  project_assignment$enddate <- as.Date(project_assignment$enddate)
+
+  # ---------------- Helpers ----------------
+  .clean_study <- function(x) {
+    x <- as.character(x)
+    x[is.na(x) | x == ""] <- "Unassigned"
+    gsub("\\s+", " ", trimws(x))  # trim + collapse internal whitespace
+  }
+
+  # Canonicalize study labels up-front
+  project_assignment$study <- .clean_study(project_assignment$study)
+
+  # ---------------- Filter by date & optional IDs ----------------
+  pvls <- pvls_raw[pvls_raw$date >= start_date & pvls_raw$date <= end_date, , drop = FALSE]
+  if (!is.null(ids)) {
+    pvls               <- pvls[pvls$id %in% ids, , drop = FALSE]
+    pvl_outcomes       <- pvl_outcomes[pvl_outcomes$id %in% ids, , drop = FALSE]
+    project_assignment <- project_assignment[project_assignment$id %in% ids, , drop = FALSE]
+  }
+
+  # Positive rows for log scale
+  pvls_plot <- pvls %>% dplyr::filter(is.finite(result), result > 0)
+  if (nrow(pvls_plot) == 0) {
+    warning("No positive pVL values to plot on log scale after filtering.")
+    return(patchwork::wrap_plots(list(), ncol = 1))
+  }
+
+  # ---------------- Outcome groups ----------------
+  outcomes_on_ts   <- c("acutePhaseSetpoint_dynamic","postARTSetpoint_dynamic","chronicPhaseSetpoint_dynamic","postReboundSetpoint_dynamic")
+  outcomes_summary <- c("onArtBlipCount_dynamic","timeToRebound_LOD_dynamic","acutePhaseBurden_dynamic")
+  pvl_outcomes$outcome_canonical <- pvl_outcomes$outcome
+
+  # ---------------- Study windows (one range per study) ----------------
+  pa <- project_assignment
+  study_ranges <- pa %>%
+    dplyr::mutate(enddate = dplyr::coalesce(enddate, date)) %>%
+    dplyr::filter(!is.na(date)) %>%
+    dplyr::group_by(study) %>%
+    dplyr::summarise(
+      start = min(date, na.rm = TRUE),
+      end   = max(enddate, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(
+      xmin = pmax(start, start_date),
+      xmax = pmin(end,   end_date)
+    ) %>%
+    dplyr::filter(xmin < xmax)
+
+  # y-span for labels on log scale (panel-wide)
+  y_min <- min(pvls_plot$result, na.rm = TRUE)
+  y_max <- max(pvls_plot$result, na.rm = TRUE)
+  interp_log <- function(y0, y1, t) exp(log(y0) + t*(log(y1) - log(y0)))
+
+
+
+  pvls_with_study <- assign_study_to_pvls(pvls_plot, pa)
+
+  study_max <- pvls_with_study %>%
+    dplyr::filter(!is.na(study_assigned)) %>%
+    dplyr::group_by(study_assigned) %>%
+    dplyr::summarise(y_top = max(result, na.rm = TRUE), .groups = "drop")
+
+  # join per-study y_top to study_ranges; default to tiny > y_min if no pVLs found
+  study_ranges <- study_ranges %>%
+    dplyr::left_join(study_max, by = c("study" = "study_assigned")) %>%
+    dplyr::mutate(
+      ytop_raw = ifelse(is.finite(y_top), y_top, NA_real_),
+      ytop = dplyr::coalesce(ytop_raw, y_min * 1.01),
+      ytop = pmax(ytop, y_min * 1.01),
+      ytop = pmin(ytop, y_max)
+    ) %>%
+    dplyr::select(-y_top, -ytop_raw)
+
+  # ----- Label tiers: labels at xmin; stack ONLY when too close in x; keep inside boxes when possible -----
+  label_min_sep_days <- 28
+  if (nrow(study_ranges) > 0) {
+    sr <- study_ranges %>%
+      dplyr::mutate(
+        lab_left  = xmin,
+        lab_right = xmin + label_min_sep_days
+      ) %>%
+      dplyr::arrange(lab_left, lab_right)
+
+    tracks_end <- as.Date(character(0))
+    track <- integer(nrow(sr))
+    for (i in seq_len(nrow(sr))) {
+      placed <- FALSE
+      if (length(tracks_end)) {
+        for (t in seq_along(tracks_end)) {
+          if (tracks_end[t] < sr$lab_left[i]) {
+            track[i] <- t
+            tracks_end[t] <- sr$lab_right[i]
+            placed <- TRUE
+            break
+          }
+        }
+      }
+      if (!placed) {
+        tracks_end <- c(tracks_end, sr$lab_right[i])
+        track[i] <- length(tracks_end)
+      }
+    }
+    sr$track <- track
+
+    # Global tier targets near panel top
+    step   <- 0.05   # 5% of log span per tier
+    base_t <- 0.98   # near top
+    sr$y_global <- interp_log(y_min, y_max, pmax(0.60, base_t - (sr$track - 1L) * step))
+
+    # Also compute "inside this box" top (2% down from each box top); then choose the lower of the two
+    sr$y_inbox <- mapply(function(top) {
+      if (!is.finite(top) || top <= y_min) return(y_min * 1.01)
+      interp_log(y_min, top, 0.98)
+    }, sr$ytop)
+
+    sr$ylab <- pmin(sr$y_global, sr$y_inbox)
+
+    study_ranges <- sr %>%
+      dplyr::mutate(ymin = y_min, ymax = ytop)
+  }
+
+  # ---------------- Base time-series ----------------
+  ts_all <- ggplot2::ggplot(pvls_plot, ggplot2::aes(x = date, y = result, group = id))
+
+  if (nrow(study_ranges) > 0) {
+    ts_all <- ts_all +
+      ggplot2::geom_rect(
+        data = study_ranges,
+        ggplot2::aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+        inherit.aes = FALSE,
+        fill = "grey70", alpha = 0.12,
+        color = "grey35", linewidth = 0.4
+      ) +
+      ggplot2::geom_text(
+        data = study_ranges,
+        ggplot2::aes(x = xmin, y = ylab, label = study),  # left-anchored at xmin
+        inherit.aes = FALSE,
+        hjust = 0, vjust = 1.05,
+        size = 3.2, fontface = "bold", alpha = 0.9
+      )
+  }
+
+  # Build PVL title
+  title_text <- paste0("Plasma Viral Load (", pvl_title, ")")
+
+  ts_all <- ts_all +
+    ggplot2::geom_line(alpha = 0.15, linewidth = 0.2, color = "grey50") +
+    ggplot2::geom_point(alpha = 0.05, size = 0.5, color = "grey40") +
+    ggplot2::scale_y_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+    ggplot2::labs(title = title_text, x = "Date", y = "pVL (copies/mL)") +
+    ggplot2::theme_minimal(base_size = 11)
+
+  # ---------------- Overlay outcome markers (no extra fill legend) ----------------
+  ts_out <- pvl_outcomes[
+    pvl_outcomes$outcome_canonical %in% outcomes_on_ts &
+      pvl_outcomes$date >= start_date & pvl_outcomes$date <= end_date &
+      is.finite(pvl_outcomes$numeric_value) & pvl_outcomes$numeric_value > 0,
+    , drop = FALSE
+  ]
+  if (nrow(ts_out) > 0) {
+  # fixed ordering so both scales use identical limits/breaks
+  outcome_levels <- c(
+    "acutePhaseSetpoint",
+    "postARTSetpoint",
+    "chronicPhaseSetpoint",
+    "acutePhasePeak_pVL",
+    "postReboundSetpoint"
+  )
+
+  outcome_palette <- c(
+    acutePhaseSetpoint   = "blue",
+    postARTSetpoint      = "red",
+    chronicPhaseSetpoint = "red4",
+    acutePhasePeak_pVL   = "purple",
+    postReboundSetpoint  = "orange"
+  )
+
+  outcome_shapes <- c(
+    acutePhaseSetpoint   = 21,  # needs fill
+    postARTSetpoint      = 21,  # needs fill
+    chronicPhaseSetpoint = 24,  # needs fill
+    acutePhasePeak_pVL   = 23,  # needs fill
+    postReboundSetpoint  = 22   # needs fill
+  )
+
+  ts_all <- ts_all +
+    ggplot2::geom_point(
+      data = ts_out,
+      ggplot2::aes(
+        x = as.Date(date),
+        y = numeric_value,
+        shape = outcome_canonical,
+        fill  = outcome_canonical
+      ),
+      color = "black", size = 1.5, alpha = 0.6, inherit.aes = FALSE
+    ) +
+    # Make both scales *identical* (same name, limits, breaks) so the legend merges,
+    # and DO NOT turn off the fill guide.
+    ggplot2::scale_shape_manual(
+      values = outcome_shapes,
+      name   = "Outcome",
+      limits = outcome_levels,
+      breaks = outcome_levels
+    ) +
+    ggplot2::scale_fill_manual(
+      values = outcome_palette,
+      name   = "Outcome",
+      limits = outcome_levels,
+      breaks = outcome_levels
+    )
+}
+
+  
+
+  sum_df <- pvl_outcomes[
+    pvl_outcomes$outcome_canonical %in% outcomes_summary &
+      pvl_outcomes$date >= start_date & pvl_outcomes$date <= end_date,
+    , drop = FALSE
+  ] %>% dplyr::filter(is.finite(numeric_value))
+
+  sum_df_stud <- assign_study_to_outcomes(sum_df, pa)
+
+  # ---------- GLOBAL: union of all studies + fixed palette (no dropping) ----------
+  all_studies <- sort(unique(c(
+    .clean_study(project_assignment$study),
+    .clean_study(sum_df_stud$study_assigned)
+  )))
+  if (!"Unassigned" %in% all_studies) all_studies <- c(all_studies, "Unassigned")
+  all_studies <- c(setdiff(all_studies, "Unassigned"), "Unassigned")
+
+  pal <- setNames(scales::hue_pal()(length(all_studies)), all_studies)
+  pal["Unassigned"] <- "grey70"
+
+  shared_fill <- ggplot2::scale_fill_manual(
+    values = pal,
+    limits = all_studies, breaks = all_studies,
+    drop = FALSE, name = "Study"
+  )
+
+  # ---------- Histogram factory: lock factors to global levels ----------
+  make_prop_hist <- function(df, oc, xlab, bins = 50) {
+    d <- df[df$outcome_canonical == oc, , drop = FALSE]
+    if (nrow(d) == 0) {
+      return(
+        ggplot2::ggplot() + ggplot2::theme_void() +
+          ggplot2::geom_text(ggplot2::aes(x = 0, y = 0, label = paste0(oc, "\n(no data)"))) +
+          ggplot2::labs(title = oc)
+      )
+    }
+    d$study_assigned <- factor(.clean_study(d$study_assigned), levels = all_studies)
+
+    ggplot2::ggplot(d, ggplot2::aes(x = numeric_value, fill = study_assigned)) +
+      ggplot2::geom_histogram(bins = bins, position = "fill",
+                              color = "grey25", linewidth = 0.2) +
+      ggplot2::scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+      ggplot2::labs(title = oc, x = xlab, y = "Proportion of bin") +
+      ggplot2::theme_minimal(base_size = 11)
+  }
+
+  # Build plots
+  p_blips   <- make_prop_hist(sum_df_stud, "onArtBlipCount",    "Blip count (per ID)")    + shared_fill
+  p_reb_lod <- make_prop_hist(sum_df_stud, "timeToRebound_LOD", "Days to rebound > LOD")  + shared_fill
+  p_auc     <- make_prop_hist(sum_df_stud, "acutePhaseBurden",  "AUC (0–56 dpi)")         + shared_fill
+
+  # Determine which plot actually has data to host the legend (some outcomes may be empty)
+  has_blips   <- nrow(sum_df_stud[sum_df_stud$outcome_canonical == "onArtBlipCount", , drop = FALSE])    > 0
+  has_reb_lod <- nrow(sum_df_stud[sum_df_stud$outcome_canonical == "timeToRebound_LOD", , drop = FALSE]) > 0
+  has_auc     <- nrow(sum_df_stud[sum_df_stud$outcome_canonical == "acutePhaseBurden", , drop = FALSE])  > 0
+
+  # Keep the legend on the first non-empty plot; turn off legends on the others.
+  if (has_blips) {
+    p_blips   <- p_blips   + ggplot2::theme(legend.position = "bottom") +
+      ggplot2::guides(fill = ggplot2::guide_legend(nrow = legend_rows, byrow = TRUE, title.position = "top"))
+    p_reb_lod <- p_reb_lod + ggplot2::theme(legend.position = "none")
+    p_auc     <- p_auc     + ggplot2::theme(legend.position = "none")
+  } else if (has_reb_lod) {
+    p_reb_lod <- p_reb_lod + ggplot2::theme(legend.position = "bottom") +
+      ggplot2::guides(fill = ggplot2::guide_legend(nrow = legend_rows, byrow = TRUE, title.position = "top"))
+    p_blips   <- p_blips   + ggplot2::theme(legend.position = "none")
+    p_auc     <- p_auc     + ggplot2::theme(legend.position = "none")
+  } else {
+    p_auc     <- p_auc     + ggplot2::theme(legend.position = "bottom") +
+      ggplot2::guides(fill = ggplot2::guide_legend(nrow = legend_rows, byrow = TRUE, title.position = "top"))
+    p_blips   <- p_blips   + ggplot2::theme(legend.position = "none")
+    p_reb_lod <- p_reb_lod + ggplot2::theme(legend.position = "none")
+  }
+
+  # Compose bar row without collecting guides (single legend retained -> avoids duplicates)
+  bars_row <- (p_blips | p_reb_lod | p_auc) +
+    patchwork::plot_layout(widths = c(1,1,1)) &
+    ggplot2::theme(
+      legend.justification = "center",
+      legend.box.just = "center",
+      legend.direction = "horizontal"
+    )
+
+  # ---------------- Final compose ----------------
+  final_plot <- ts_all / bars_row +
+    patchwork::plot_layout(heights = c(3, 1)) &
+    ggplot2::theme(plot.margin = ggplot2::margin(10, 10, 10, 10))
+
+  final_plot
+}
+
+
+# Save a directory of PNGs: (1) all IDs, (2) MHC IDs, (3) one per study from project_assignment
+
+library(ggplot2)
+library(dplyr)
+
+# ---- config ----
+out_dir <- file.path(getwd(), "pvl_images")
+img_w   <- 25     # inches
+img_h   <- 11     # inches
+img_dpi <- 300
+
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+# study label cleaner (match function's internal behavior)
+.clean_study <- function(x) {
+  x <- as.character(x)
+  x[is.na(x) | x == ""] <- "Unassigned"
+  gsub("\\s+", " ", trimws(x))
+}
+.safe <- function(x) gsub("[^A-Za-z0-9._-]+", "_", x)
+
+.save_fig <- function(plot_obj, basename) {
+  f <- file.path(out_dir, paste0(.safe(basename), ".png"))
+  ggsave(
+    filename  = f,
+    plot      = plot_obj,
+    width     = img_w,
+    height    = img_h,
+    units     = "in",
+    dpi       = img_dpi,
+    bg        = "white",
+    limitsize = FALSE
+  )
+  f
+}
+
+# ---- 1) All IDs ----
+fig_all <- MakePVLOutcomeFigures_AllIds(
+  pvls_raw            = pvls_raw,
+  pvl_outcomes        = pvl_outcomes,
+  project_assignment  = project_assignment,
+  ids                 = NULL,
+  start_date          = as.Date("2010-01-01"),
+  end_date            = as.Date("2025-12-30"),
+  pvl_title           = "all IDs"
+)
+file_all <- .save_fig(fig_all, "pvl_all_ids")
+
+# ---- 2) MHC IDs (if available) ----
+files_mhc <- character(0)
+if (exists("mhc_ids") && length(mhc_ids) > 0) {
+  fig_mhc <- MakePVLOutcomeFigures_AllIds(
+    pvls_raw            = pvls_raw,
+    pvl_outcomes        = pvl_outcomes,
+    project_assignment  = project_assignment,
+    ids                 = mhc_ids,
+    start_date          = as.Date("2010-01-01"),
+    end_date            = as.Date("2025-12-30"),
+    pvl_title           = "MHC IDs"
+  )
+  files_mhc <- .save_fig(fig_mhc, "pvl_mhc_ids")
+}
+
+# ---- 3) One per study (from project_assignment) ----
+pa2 <- project_assignment %>%
+  mutate(study_clean = .clean_study(study))
+
+studies_vec <- sort(unique(pa2$study_clean))
+ids_for_study <- function(study_name) {
+  pa2 %>% filter(study_clean == study_name) %>% pull(id) %>% unique()
+}
+
+files_by_study <- unlist(lapply(studies_vec, function(st) {
+  ids_vec <- ids_for_study(st)
+  if (length(ids_vec) == 0) return(character(0))
+  fig <- MakePVLOutcomeFigures_AllIds(
+    pvls_raw            = pvls_raw,
+    pvl_outcomes        = pvl_outcomes,
+    project_assignment  = project_assignment,
+    ids                 = ids_vec,
+    start_date          = as.Date("2010-01-01"),
+    end_date            = as.Date("2025-12-30"),
+    pvl_title           = st
+  )
+  .save_fig(fig, paste0("pvl_", st))
+}), use.names = FALSE)
+
+# ---- summary ----
+saved_files <- c(file_all, files_mhc, files_by_study)
+cat("Saved", length(saved_files), "images to:\n", normalizePath(out_dir), "\n")
+saved_files
+
+
+
+```
+
+```{r}
+# Adaptive window thing
+library(changepoint)
+change_points <- pvls_raw %>% 
+  filter(id == 36839) %>% 
+  arrange(as.Date(date)) %>% 
+  pull(result) %>% 
+  log10(.) %>% 
+  changepoint::cpt.meanvar(., method = "PELT", 
+                           penalty = "BIC", 
+                           test.stat = "Gamma") 
+
+plot(change_points)
+cpts(change_points)
+```
+```{r}
+# --- Multinomial analysis across outcomes with pagination + multi-page PDF ---
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(forcats)
+  library(purrr)
+  library(ggplot2)
+  library(scales)
+  library(caret)
+  library(glmnet)
+  library(nnet)      # multinom()
+  library(broom)
+  library(patchwork)
+})
+
+# Assumes you already have:
+#   - mhc_df: id, A01/A02/B08/B17 as factors with levels c("NEG","POS")
+#   - out_wide: one row per id, columns = outcomes (numeric)
+#   - desired_outcomes: character vector of outcome column names
+
+# ---------------- CONFIG ----------------
+K_bins <- 3                 # number of categories for multinomial
+min_complete_n <- 60        # minimum rows to fit an outcome
+N_per_page <- 6             # outcomes per PDF page
+top_N_total <- NULL         # set e.g. 30 to truncate; NULL = include all
+
+set.seed(123)
+
+# ---------------- Helpers ----------------
+make_outcome_factor <- function(v, k = 3, min_unique = 10) {
+  v <- as.numeric(v)
+  ok <- is.finite(v)
+  v_ok <- v[ok]
+  if (length(unique(v_ok)) < min_unique) return(NULL)
+
+  probs <- seq(0, 1, length.out = k + 1)
+  qs <- unique(quantile(v_ok, probs = probs, na.rm = TRUE, type = 7))
+  if (length(qs) <= 2) return(NULL)
+
+  f <- cut(v, breaks = qs, include.lowest = TRUE, right = TRUE, dig.lab = 10)
+  if (k == 3) levels(f) <- c("Low","Medium","High")[seq_along(levels(f))]
+  f
+}
+
+summ_from_cm <- function(cm) {
+  acc   <- unname(cm$overall["Accuracy"])
+  kappa <- unname(cm$overall["Kappa"])
+  bc <- cm$byClass
+  if (is.null(dim(bc))) {
+    precision <- unname(bc["Pos Pred Value"])
+    recall    <- unname(bc["Sensitivity"])
+    f1_macro  <- if (is.na(precision) || is.na(recall) || (precision+recall)==0) NA_real_
+                 else 2*precision*recall/(precision+recall)
+  } else {
+    ppv   <- suppressWarnings(as.numeric(bc[,"Pos Pred Value"]))
+    tpr   <- suppressWarnings(as.numeric(bc[,"Sensitivity"]))
+    f1vec <- ifelse(is.na(ppv) | is.na(tpr) | (ppv+tpr)==0, NA_real_, 2*ppv*tpr/(ppv+tpr))
+    f1_macro <- mean(f1vec, na.rm = TRUE)
+  }
+  tibble::tibble(Accuracy = acc, Kappa = kappa, F1_macro = f1_macro)
+}
+
+# ---------------- Core runner (one outcome) ----------------
+fit_multinom_for_outcome <- function(y_col, K = K_bins, seed = 123) {
+  dat <- mhc_df %>%
+    inner_join(out_wide %>% select(id, all_of(y_col)), by = "id") %>%
+    drop_na(A01, A02, B08, B17, !!sym(y_col))
+
+  y_fac <- make_outcome_factor(dat[[y_col]], k = K)
+  if (is.null(y_fac)) return(NULL)
+
+  dat$outcome_cat <- y_fac
+  dat <- dat %>% drop_na(outcome_cat)
+  if (nrow(dat) < min_complete_n || length(levels(dat$outcome_cat)) < 3) return(NULL)
+
+  x <- model.matrix(~ A01 + A02 + B08 + B17, data = dat)[, -1, drop = FALSE]
+  y <- dat$outcome_cat
+
+  set.seed(seed)
+  cv_ctrl <- trainControl(
+    method = "cv",
+    number = 10,
+    classProbs = TRUE,
+    savePredictions = "final"
+  )
+
+  model_caret <- caret::train(
+    x = x, y = y,
+    method = "glmnet",
+    family = "multinomial",
+    trControl = cv_ctrl,
+    tuneGrid = expand.grid(
+      alpha = seq(0, 1, by = 0.1),
+      lambda = 10^seq(-3, 1, length.out = 50)
+    )
+  )
+
+  preds <- model_caret$pred
+  best  <- model_caret$bestTune
+  preds_best <- preds %>% semi_join(best, by = c("alpha","lambda"))
+  cm <- confusionMatrix(preds_best$pred, preds_best$obs)
+
+  multi_fit <- multinom(outcome_cat ~ A01 + A02 + B08 + B17, data = dat, Hess = TRUE, trace = FALSE)
+
+  coef_tbl <- broom::tidy(multi_fit, exponentiate = TRUE, conf.int = TRUE) %>%
+    dplyr::filter(term %in% c("A01POS","A02POS","B08POS","B17POS")) %>%
+    dplyr::mutate(
+      outcome = y_col,
+      allele  = stringr::str_remove(term, "POS$"),
+      class   = .data$y.level,   # class vs baseline from multinom
+      OR      = estimate,
+      OR_low  = conf.low,
+      OR_high = conf.high
+    ) %>%
+    dplyr::select(outcome, class, allele, OR, OR_low, OR_high, std.error, statistic, p.value)
+
+  cm_tbl <- as.data.frame(cm$table)
+  names(cm_tbl) <- c("Predicted","Actual","n")
+  cm_row_norm <- cm_tbl %>%
+    group_by(Actual) %>%
+    mutate(prop = n / sum(n)) %>%
+    ungroup()
+
+  p_conf <- ggplot(cm_row_norm, aes(x = Predicted, y = Actual, fill = prop)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = sprintf("%.2f", prop)), size = 3) +
+    scale_fill_gradient(low = "white", high = muted("blue")) +
+    labs(
+      title = paste0(y_col, " — CV Confusion Matrix (row-normalized)"),
+      x = "Predicted class", y = "True class", fill = "Proportion"
+    ) +
+    theme_minimal(base_size = 11)
+
+  p_coef <- coef_tbl %>%
+    mutate(
+      allele = factor(allele, levels = c("A01","A02","B08","B17")),
+      class  = factor(class)
+    ) %>%
+    ggplot(aes(x = allele, y = OR, ymin = OR_low, ymax = OR_high)) +
+    geom_hline(yintercept = 1, linetype = "dashed", linewidth = 0.4) +
+    geom_pointrange(position = position_dodge(width = 0.4)) +
+    scale_y_log10() +
+    facet_wrap(~ class) +
+    labs(
+      title = paste0(y_col, " — Multinomial Odds Ratios (POS vs NEG)"),
+      y = "Odds ratio (log scale)", x = "MHC allele"
+    ) +
+    theme_minimal(base_size = 11)
+
+  list(
+    outcome    = y_col,
+    n          = nrow(dat),
+    caret      = model_caret,
+    cm         = cm,
+    confusion_plot = p_conf,
+    multinom   = multi_fit,
+    coef_tbl   = coef_tbl,
+    coef_plot  = p_coef
+  )
+}
+
+# ---------------- Run across outcomes ----------------
+present_outcomes <- intersect(desired_outcomes, names(out_wide))
+multi_results <- purrr::map(present_outcomes, fit_multinom_for_outcome)
+multi_results <- purrr::compact(multi_results)
+
+if (length(multi_results) == 0) stop("No outcomes qualified for multinomial modeling.")
+
+# ---------------- Summaries & ranking ----------------
+perf_summary <- purrr::map_dfr(
+  multi_results,
+  ~ dplyr::bind_cols(
+      tibble::tibble(outcome = .x$outcome, n = .x$n),
+      summ_from_cm(.x$cm)
+    )
+)
+
+perf_summary <- perf_summary %>%
+  dplyr::mutate(rank_score = dplyr::coalesce(F1_macro, 0)*2 + dplyr::coalesce(Accuracy, 0) + scales::rescale(n)) %>%
+  dplyr::arrange(dplyr::desc(rank_score))
+
+print(perf_summary)
+
+
+
+# ---------------- Paginate and save multi-page PDF ----------------
+ordered_outcomes <- perf_summary$outcome
+if (!is.null(top_N_total)) {
+  ordered_outcomes <- head(ordered_outcomes, top_N_total)
+}
+
+res_by_name <- rlang::set_names(multi_results, purrr::map_chr(multi_results, "outcome"))
+
+make_page_plot <- function(outcome_names) {
+  panels <- purrr::map(outcome_names, function(oc) {
+    res <- res_by_name[[oc]]
+    metrics <- perf_summary %>% dplyr::filter(outcome == oc)
+    subtitle_txt <- sprintf("n=%d | Acc=%.2f | F1=%.2f | Kappa=%.2f",
+                            metrics$n, metrics$Accuracy, metrics$F1_macro, metrics$Kappa)
+    (res$confusion_plot + labs(subtitle = subtitle_txt)) | res$coef_plot
+  })
+  patchwork::wrap_plots(panels, ncol = 1) +
+    patchwork::plot_annotation(title = "Multinomial classification (paginated)")
+}
+
+pages <- split(ordered_outcomes, ceiling(seq_along(ordered_outcomes)/N_per_page))
+page_plots <- purrr::map(pages, make_page_plot)
+
+
+suppressPackageStartupMessages({
+  library(purrr); library(dplyr); library(ggplot2); library(stringr)
+})
+
+stopifnot(length(multi_results) > 0)
+
+out_dir_single <- "multinom_pages_single"
+dir.create(out_dir_single, showWarnings = FALSE)
+combined_pdf  <- file.path(getwd(), "multinom_panels.pdf")
+
+.sanitize <- function(x) {
+  x <- gsub("[^A-Za-z0-9._-]+", "_", x)
+  x <- gsub("_+", "_", x)
+  x <- sub("^_+", "", x)
+  x <- sub("_+$", "", x)
+  x
+}
+
+outcome_to_file <- map_chr(multi_results, function(res) {
+  oc <- res$outcome
+  metrics <- perf_summary %>% filter(outcome == oc)
+  subtitle_txt <- sprintf("n=%d | Acc=%.2f | F1=%.2f | Kappa=%.2f",
+                          metrics$n, metrics$Accuracy, metrics$F1_macro, metrics$Kappa)
+
+  p <- (res$confusion_plot + labs(subtitle = subtitle_txt)) | res$coef_plot
+  p <- p + patchwork::plot_annotation(title = paste("Multinomial classification:", oc))
+
+  outfile <- file.path(out_dir_single, paste0("multinom_", .sanitize(oc), ".pdf"))
+  ggsave(outfile, plot = p, width = 12, height = 6, units = "in", device = cairo_pdf)
+  outfile
+})
+
+if (!requireNamespace("pdftools", quietly = TRUE)) {
+  stop("Package 'pdftools' is not installed. Run install.packages('pdftools').")
+}
+pdftools::pdf_combine(input = outcome_to_file, output = combined_pdf)
+
+message("Wrote combined multipage PDF: ", combined_pdf)
+
+
+# ---------------- (Optional) compact across-outcomes heatmaps ----------------
+coef_across <- purrr::map_dfr(multi_results, "coef_tbl")
+
+# 3a) Aggregate over classes: one row per outcome
+agg_across <- coef_across %>%
+  dplyr::group_by(outcome, allele) %>%
+  dplyr::summarise(
+    max_abs_logOR = {
+      lor <- log(OR)
+      s <- sign(lor[which.max(abs(lor))])
+      max(abs(lor), na.rm = TRUE) * s
+    },
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    outcome = factor(outcome, levels = perf_summary$outcome),
+    allele  = factor(allele, levels = c("A01","A02","B08","B17"))
+  )
+
+p_heat_outcome <- ggplot(agg_across, aes(x = allele, y = outcome, fill = max_abs_logOR)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = muted("blue"), mid = "white", high = muted("red"),
+                       midpoint = 0, name = "log(OR)\n(max |effect|)") +
+  labs(title = "Allele effects per outcome (compact view)", x = "MHC allele", y = "Outcome") +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid = element_blank())
+
+p_heat_outcome
+
+ggsave("multinom_effects_heatmap_compact.pdf", p_heat_outcome, width = 8, height = 10)
+
+# 3b) Facet by class (denser)
+coef_facet <- coef_across %>%
+  dplyr::mutate(
+    outcome = factor(outcome, levels = perf_summary$outcome),
+    allele  = factor(allele, levels = c("A01","A02","B08","B17")),
+    logOR   = log(OR)
+  )
+
+p_heat_facet <- ggplot(coef_facet, aes(x = allele, y = outcome, fill = logOR)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = muted("blue"), mid = "white", high = muted("red"),
+                       midpoint = 0, name = "log(OR)") +
+  labs(title = "Allele effects by multinom class", x = "MHC allele", y = "Outcome") +
+  theme_minimal(base_size = 10) +
+  theme(panel.grid = element_blank(),
+        strip.text = element_text(size = 9)) +
+  facet_wrap(~ class, ncol = 2)
+
+p_heat_facet
+
+ggsave("multinom_effects_heatmap_by_class.pdf", p_heat_facet, width = 12, height = 12)
+
+
+```
+Linear modeling
+```{r}
+# --- Dependencies ---
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(purrr)
+  library(forcats)
+  library(broom)
+  library(ggplot2)
+  library(scales)
+})
+
+# --------- CONFIG ---------
+mhc_cols <- c("mhcgenotypes_a01", "mhcgenotypes_a02",
+              "mhcgenotypes_b08", "mhcgenotypes_b17")
+
+# Outcomes you enumerated
+desired_outcomes <- c(
+  "acutePhaseBurden","acutePhasePeak_day","acutePhasePeak_pVL",
+  "acutePhaseSetpoint","chronicPhaseSetpoint",
+  "onArtBlipCount","postARTSetpoint","postReboundSetpoint", "timeToRebound_LOD"
+)
+
+# Optional: log10-transform strictly-positive, skewed outcomes (names matched case-insensitively)
+log10_outcome_patterns <- c("setpoint", "pvl", "burden")
+# We intentionally DO NOT log-transform time-to-rebound metrics.
+
+# --------- Helpers ---------
+coerce_posneg_factor <- function(x) {
+  # Normalize to {NEG, POS} factor with NEG as reference; NA preserved.
+  tx <- toupper(trimws(as.character(x)))
+  tx[tx %in% c("0","FALSE","F","NO","N","NEGATIVE","-")] <- "NEG"
+  tx[tx %in% c("1","TRUE","T","YES","Y","POSITIVE","+")] <- "POS"
+  # Keep only "POS"/"NEG" (others -> NA)
+  tx[!(tx %in% c("POS","NEG"))] <- NA
+  factor(tx, levels = c("NEG","POS"))
+}
+
+safe_first <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) NA_real_ else x[1]
+}
+
+should_log10 <- function(outcome_name, vec) {
+  nm <- tolower(outcome_name)
+  pattern_hit  <- any(str_detect(nm, log10_outcome_patterns))
+  # never log-transform time-to-rebound
+  if (str_detect(nm, "timetorebound")) return(FALSE)
+  is.numeric(vec) && all(vec[!is.na(vec)] > 0) && pattern_hit
+}
+
+# --------- Prepare MHC flags (POS/NEG) ---------
+mhc_df <- mhc_ids %>%
+  mutate(id = as.character(id)) %>%
+  select(id, all_of(mhc_cols)) %>%
+  mutate(across(all_of(mhc_cols), coerce_posneg_factor)) %>%
+  rename(A01 = mhcgenotypes_a01,
+         A02 = mhcgenotypes_a02,
+         B08 = mhcgenotypes_b08,
+         B17 = mhcgenotypes_b17)
+
+# --------- Prepare outcomes (one value per id per outcome) ---------
+# Expect pvl_outcomes: id, outcome, numeric_value, (string_value, comments, datasource)
+out_wide <- pvl_outcomes %>%
+  mutate(id = as.character(id)) %>%
+  group_by(id, outcome) %>%
+  summarise(value = safe_first(numeric_value), .groups = "drop") %>%
+  group_by(outcome) %>%
+  mutate(value = if (should_log10(unique(outcome), value)) log10(value) else value) %>%
+  ungroup() %>%
+  pivot_wider(names_from = outcome, values_from = value)
+
+# --------- Join MHC to outcomes; keep only subjects present in both ---------
+dat <- mhc_df %>%
+  inner_join(out_wide, by = "id")
+
+if (nrow(dat) == 0) stop("No overlapping subjects between pvl_outcomes and mhc_ids after join on 'id'.")
+
+# Limit to the outcomes you listed and that exist:
+candidate_outcomes <- intersect(desired_outcomes, names(dat))
+
+# Keep outcomes with enough data
+min_non_na <- 20
+outcomes_to_fit <- candidate_outcomes[
+  sapply(candidate_outcomes, function(cn) sum(!is.na(dat[[cn]])) >= min_non_na)
+]
+if (length(outcomes_to_fit) == 0) stop("No outcome columns have at least ", min_non_na, " non-missing values.")
+
+# --------- Fit per-outcome models: outcome ~ A01 + A02 + B08 + B17 ---------
+# MHC terms are factors: effect is POS vs NEG (NEG is the reference)
+fit_one <- function(ycol) {
+  df <- dat %>%
+    select(id, A01, A02, B08, B17, all_of(ycol)) %>%
+    drop_na(A01, A02, B08, B17, all_of(ycol))
+
+  # ensure both levels exist for each MHC; if a term is single-level, it will be dropped by lm()
+  if (nrow(df) < 10) return(NULL)
+
+  f <- as.formula(paste(ycol, "~ A01 + A02 + B08 + B17"))
+  fit <- try(lm(f, data = df), silent = TRUE)
+  if (inherits(fit, "try-error")) return(NULL)
+
+  broom::tidy(fit, conf.int = TRUE) %>%
+    # retain only the POS vs NEG contrasts; terms look like A01POS, A02POS, ...
+    filter(str_detect(term, "^(A01|A02|B08|B17)POS$")) %>%
+    mutate(
+      mhc = str_replace(term, "POS$", ""),
+      level = "POS_vs_NEG",
+      outcome = ycol,
+      n = nrow(df)
+    ) %>%
+    select(outcome, mhc, level, estimate, conf.low, conf.high, statistic, p.value, n)
+}
+
+results_list <- purrr::map(outcomes_to_fit, fit_one)
+results <- bind_rows(results_list)
+
+if (nrow(results) == 0) stop("All models failed or contained no estimable MHC effects.")
+
+# BH adjust across all tested coefficients
+results <- results %>%
+  mutate(p_adj = p.adjust(p.value, method = "BH")) %>%
+  arrange(outcome, p_adj)
+
+# --------- Visualizations ---------
+
+# 1) Coefficient plot (β for POS vs NEG) with 95% CIs, faceted by outcome
+coef_plot <- results %>%
+  mutate(
+    mhc = factor(mhc, levels = c("A01","A02","B08","B17")),
+    outcome = fct_reorder(outcome, pmin(p_adj, 1))
+  ) %>%
+  ggplot(aes(x = mhc, y = estimate, ymin = conf.low, ymax = conf.high)) +
+  geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.4) +
+  geom_pointrange(position = position_dodge(width = 0.3)) +
+  facet_wrap(~ outcome, scales = "free_y") +
+  labs(
+    title = "Effect of MHC POS vs NEG on pVL Outcomes",
+    subtitle = "β is the difference (POS − NEG) on the outcome scale (log10 for selected outcomes)",
+    x = "MHC indicator",
+    y = "Effect size (β)"
+  ) +
+  theme_minimal(base_size = 12)
+
+# 2) Heatmap of t-statistics (directional standardized effects)
+heatmap_plot <- results %>%
+  mutate(
+    mhc = factor(mhc, levels = c("A01","A02","B08","B17")),
+    outcome = factor(outcome, levels = unique(outcome))
+  ) %>%
+  ggplot(aes(x = mhc, y = outcome, fill = statistic)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = sprintf("%.2f", statistic)), size = 3) +
+  scale_fill_gradient2(low = muted("blue"), mid = "white", high = muted("red"),
+                       midpoint = 0, name = "t-stat") +
+  labs(
+    title = "Standardized Effects (t) for MHC POS vs NEG",
+    x = "MHC indicator",
+    y = "Outcome"
+  ) +
+  theme_minimal(base_size = 12)
+
+# --------- Output objects ---------
+mhc_outcome_effects <- results %>%
+  select(outcome, mhc, level, estimate, conf.low, conf.high, statistic, p.value, p_adj, n)
+
+print(mhc_outcome_effects)
+print(coef_plot)
+print(heatmap_plot)
+
+# To save:
+# ggsave("mhc_coef_plot.png", coef_plot, width = 12, height = 8, dpi = 300)
+# ggsave("mhc_heatmap_plot.png", heatmap_plot, width = 8, height = 10, dpi = 300)
+
+
+# count mhcs
+as.data.frame(table(unlist(lapply(asplit(mhc_df[,-1], 1), function(r) apply(do.call(rbind, combinat::permn(unlist(r))), 1, paste, collapse="_")))))
+```
+
+```{r}
+# Boxplots for desired outcomes in the MHC subset, grouped by B08+, B17+, Other.
+# - Keep only IDs with at least one POS in ANY of A01/A02/B08/B17
+# - Grouping precedence: B08+ first; else B17+; else Other (A01+/A02+ map to Other)
+# - Outcomes: desired_outcomes (below)
+# - Subset to ids in `mhc_ids` before computing
+# - Mild outlier control via per-outcome winsorization (1–99%)
+
+library(dplyr)
+library(ggplot2)
+library(forcats)
+
+desired_outcomes <- c(
+  "acutePhaseBurden","acutePhasePeak_day","acutePhasePeak_pVL",
+  "acutePhaseSetpoint","chronicPhaseSetpoint",
+  "onArtBlipCount","postARTSetpoint","postReboundSetpoint","timeToRebound_LOD"
+)
+
+outcome_labels <- c(
+  acutePhaseBurden      = "Acute burden (AUC 0–56 d)",
+  acutePhasePeak_day    = "Acute peak (day)",
+  acutePhasePeak_pVL    = "Acute peak (pVL)",
+  acutePhaseSetpoint    = "Acute setpoint",
+  chronicPhaseSetpoint  = "Chronic setpoint",
+  onArtBlipCount        = "On-ART blip count",
+  postARTSetpoint       = "Post-ART setpoint",
+  postReboundSetpoint   = "Post-rebound setpoint",
+  timeToRebound_LOD     = "Days to rebound > LOD"
+)
+
+stopifnot(exists("mhc_ids"), exists("mhc_df"))
+mhc_ids <- unique(mhc_ids)
+
+# --- MHC grouping with 4 markers; drop rows where ALL are NEG/NA ---
+mhc_groups <- mhc_df %>%
+  transmute(
+    id,
+    A01u = toupper(A01),
+    A02u = toupper(A02),
+    B08u = toupper(B08),
+    B17u = toupper(B17)
+  ) %>%
+  # keep if ANY marker is POS
+  filter(A01u == "POS" | A02u == "POS" | B08u == "POS" | B17u == "POS") %>%
+  transmute(
+    id,
+    mhc_group = case_when(
+      B08u == "POS" ~ "B08+",   # includes B08+/B17+ multi-POS
+      B17u == "POS" ~ "B17+",   # B17-only (since B08+ was caught above)
+      TRUE          ~ "Other"    # A01+/A02+ (and no B08/B17 POS)
+    )
+  )
+
+# --- Assemble data, subset to mhc_ids & desired outcomes ---
+df_raw <- pvl_outcomes %>%
+  filter(id %in% mhc_ids,
+         outcome %in% desired_outcomes,
+         is.finite(numeric_value)) %>%
+  inner_join(mhc_groups, by = "id") %>%
+  mutate(
+    mhc_group = factor(mhc_group, levels = c("B08+","B17+","Other")),
+    outcome   = factor(outcome, levels = desired_outcomes),
+    facet_lab = fct_relabel(outcome, function(x) outcome_labels[x])
+  )
+
+# --- Mild outlier control: per-outcome winsorization (1–99%) ---
+winsor_lo <- 0.01; winsor_hi <- 0.99
+quant_limits <- df_raw %>%
+  group_by(outcome) %>%
+  summarize(
+    lo = as.numeric(quantile(numeric_value, winsor_lo, na.rm = TRUE, names = FALSE)),
+    hi = as.numeric(quantile(numeric_value, winsor_hi, na.rm = TRUE, names = FALSE)),
+    .groups = "drop"
+  ) %>%
+  mutate(hi = ifelse(hi <= lo, lo + 1e-9, hi))
+
+df <- df_raw %>%
+  left_join(quant_limits, by = "outcome") %>%
+  mutate(numeric_value_w = pmin(pmax(numeric_value, lo), hi))
+
+# --- Plot ---
+p_box <- ggplot(df, aes(x = mhc_group, y = numeric_value_w, fill = mhc_group)) +
+  geom_boxplot(outlier.shape = NA, width = 0.7) +
+  geom_point(position = position_jitter(width = 0.18, height = 0, seed = 1),
+             alpha = 0.35, size = 1, shape = 21, stroke = 0.2) +
+  facet_wrap(~ facet_lab, scales = "free_y", ncol = 3) +
+  scale_fill_manual(values = c("B08+" = "#1b9e77", "B17+" = "#d95f02", "Other" = "grey70"),
+                    name = "MHC group") +
+  labs(
+    title = "Control subset: computed pVL outcomes by MHC",
+    x = NULL, y = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "top",
+    strip.text = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+p_box
+
+# To save:
+# ggsave("pvl_mhc_setpoint_boxplots_filtered_4markers.png", p_box, width = 14, height = 9, dpi = 300, bg = "white")
+
+```
+
+```{r}
+# --- Libraries ---------------------------------------------------------------
+library(Rlabkey)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(broom)
+library(forcats)
+library(patchwork)
+library(lubridate)
+library(purrr)
+
+# --- LabKey connection defaults (edit if you already set globally) ----------
+base_url   <- "https://prime-seq.ohsu.edu"
+folderPath <- "/Labs/Bimber/Collaborations/SIV_Studies"
+
+# --- 1) IDs in MHC Cohort 1 --------------------------------------------------
+mhc_ids <- unique(labkey.selectRows(
+  baseUrl       = base_url,
+  folderPath    = folderPath,
+  schemaName    = "study",
+  queryName     = "assignment",
+  colSelect     = "Id,date,enddate,study,subgroup,cohortAlias,category,cohortId,dataSource",
+  colSort       = "Id",
+  colFilter     = makeFilter(c("study", "EQUAL", "MHC Cohort 1")),
+  containerFilter = NULL,
+  colNameOpt    = "rname"
+)$id)
+
+# --- 2) Demographics (MHC Type view) for genotype calls ----------------------
+demo_raw <- labkey.selectRows(
+  baseUrl       = base_url,
+  folderPath    = folderPath,
+  schemaName    = "study",
+  queryName     = "Demographics",
+  viewName      = "MHC Type",
+  colSelect     = "Id,sex,species,geographic_origin,calculated_status,birth,death,mhcGenotypes/assayTypes,mhcGenotypes/A01,mhcGenotypes/A02,mhcGenotypes/B08,mhcGenotypes/B17,mhcGenotypes/allAlleles",
+  colSort       = "Id",
+  containerFilter = NULL,
+  colNameOpt    = "rname"
+)
+
+demo <- demo_raw %>% filter(id %in% mhc_ids)
+
+# Flags: treat non-missing and not "NEG" as positive
+geno_flags <- demo %>%
+  transmute(
+    Id = id,
+    A01 = !is.na(mhcgenotypes_a01) & toupper(as.character(mhcgenotypes_a01)) != "NEG",
+    A02 = !is.na(mhcgenotypes_a02) & toupper(as.character(mhcgenotypes_a02)) != "NEG",
+    B08 = !is.na(mhcgenotypes_b08) & toupper(as.character(mhcgenotypes_b08)) != "NEG",
+    B17 = !is.na(mhcgenotypes_b17) & toupper(as.character(mhcgenotypes_b17)) != "NEG"
+  )
+
+# --- 3) PVL Outcomes: keep only the three dynamic setpoints ------------------
+wanted_outcomes <- c(
+  "acutePhaseSetpoint_dynamic",
+  "onArtSetpoint_dynamic",
+  "postReboundSetpoint_dynamic",
+  "chronicPhaseSetpoint_dynamic"
+)
+
+pvl_raw <- labkey.selectRows(
+  baseUrl       = base_url,
+  folderPath    = folderPath,
+  schemaName    = "study",
+  queryName     = "pvl_outcomes",
+  colSelect     = "Id,date,enddate,outcome,numeric_value,string_value,comments,dataSource",
+  colSort       = "Id,-outcome",
+  containerFilter = NULL,
+  colNameOpt    = "rname"
+)
+
+pvl <- pvl_raw %>%
+  filter(id %in% geno_flags$Id, outcome %in% wanted_outcomes) %>%
+  mutate(
+    enddate = suppressWarnings(as_date(enddate)),
+    date    = suppressWarnings(as_date(date)),
+    sort_key = coalesce(enddate, date),
+    numeric_value = suppressWarnings(as.numeric(numeric_value))
+  ) %>%
+  filter(!is.na(numeric_value)) %>%
+  group_by(id, outcome) %>%
+  slice_max(order_by = sort_key, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(Id = id, outcome, value = numeric_value)
+
+# Readable labels
+outcome_labs <- c(
+  acutePhaseSetpoint_dynamic  = "Acute Phase Setpoint",
+  onArtSetpoint_dynamic       = "On-ART Setpoint",
+  postReboundSetpoint_dynamic = "Post-Rebound Setpoint",
+  chronicPhaseSetpoint_dynamic = "Non-ART Chronic Phase Setpoint"
+)
+
+pvl_labeled <- pvl %>%
+  mutate(Outcome = fct_relevel(outcome_labs[outcome],
+                               "Acute Phase Setpoint",
+                               "On-ART Setpoint",
+                               "Post-Rebound Setpoint")) %>%
+  select(-outcome)
+
+# --- 4) Join outcomes to genotype flags; long form for plotting --------------
+dat <- pvl_labeled %>%
+  inner_join(geno_flags, by = "Id") %>%
+  pivot_longer(cols = c(A01, A02, B08, B17),
+               names_to = "GenotypeFlag",
+               values_to = "Positive") %>%
+  mutate(
+    Genotype = factor(GenotypeFlag, levels = c("A01","A02","B08","B17"),
+                      labels = c("A01+","A02+","B08+","B17+"))
+  )
+
+panelA_df <- dat %>% filter(Positive)
+
+# --- 4a) Remove ONLY scatter outliers using IQR rule per (Outcome, Genotype) --
+iqr_bounds <- panelA_df %>%
+  group_by(Outcome, Genotype) %>%
+  summarize(
+    q1  = quantile(value, 0.25, na.rm = TRUE),
+    q3  = quantile(value, 0.75, na.rm = TRUE),
+    iqr = q3 - q1,
+    lower = q1 - 1.5 * iqr,
+    upper = q3 + 1.5 * iqr,
+    .groups = "drop"
+  )
+
+panelA_points_df <- panelA_df %>%
+  inner_join(iqr_bounds, by = c("Outcome","Genotype")) %>%
+  mutate(is_outlier = value < lower | value > upper) %>%
+  filter(!is_outlier)
+
+# --- 5) Panel A: Box (all data, outliers hidden) + scatter (no outliers) -----
+pA <- ggplot() +
+  geom_boxplot(
+    data = panelA_df,
+    aes(x = Genotype, y = value),
+    outlier.shape = NA, width = 0.6, alpha = 0.9
+  ) +
+  geom_point(
+    data = panelA_points_df,
+    aes(x = Genotype, y = value),
+    position = position_jitter(width = 0.15, height = 0, seed = 7),
+    size = 1.8, alpha = 0.6
+  ) +
+  facet_wrap(~ Outcome, nrow = 1, scales = "free_y") +
+  labs(
+    x = NULL,
+    y = "Setpoint (numeric_value)",
+    title = "Setpoints across MHC Genotypes"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(angle = 0, vjust = 0.5),
+    strip.text = element_text(face = "bold"),
+    plot.title = element_text(face = "bold", hjust = 0.5)
+  )
+
+# --- 6) Panel B: Independent effects per genotype ----------------------------
+# For each (Outcome, GenotypeFlag ∈ {A01,A02,B08,B17}), fit: value ~ G (0/1)
+# β is the mean difference (Positive − Negative) with 95% CI.
+
+# --- 6) Panel B: Independent effects per genotype (Welch t-test) -------------
+library(purrr)
+
+model_df <- pvl_labeled %>% inner_join(geno_flags, by = "Id")
+geno_cols <- c("A01","A02","B08","B17")
+
+df <- model_df %>%
+  mutate(
+    across(all_of(geno_cols), ~ as.integer(as.logical(.)))
+  ) %>%
+  filter(!is.na(value)) %>%
+  drop_na(all_of(geno_cols))
+
+effects <- df %>%
+  group_by(Outcome) %>%
+  group_modify(~{
+    this <- .x
+
+    # keep genotype columns that vary within this outcome
+    keep <- geno_cols[vapply(this[geno_cols], function(v) n_distinct(v) > 1, logical(1))]
+    if (length(keep) == 0) return(tibble())
+
+    fit <- try(lm(reformulate(keep, response = "value"), data = this), silent = TRUE)
+    if (inherits(fit, "try-error")) return(tibble())
+
+    coefs <- tidy(fit, conf.int = TRUE) %>% filter(term %in% keep)
+    if (nrow(coefs) == 0) return(tibble())
+
+    # DO NOT include Outcome here; group_modify will add it back
+    transmute(
+      coefs,
+      genotype = term,
+      estimate, conf.low, conf.high, p.value
+    )
+  }) %>%
+  ungroup()
+
+# Optional: order outcomes by mean |effect|
+effects <- effects %>%
+  group_by(Outcome) %>%
+  mutate(.avg_abs = mean(abs(estimate), na.rm = TRUE)) %>%
+  ungroup() %>%
+  mutate(Outcome = fct_reorder(Outcome, .avg_abs)) %>%
+  select(-.avg_abs)
+
+# Single-panel forest-style plot
+pB <- ggplot(
+  data = model_df %>%
+    mutate(across(all_of(c("A01","A02","B08","B17")), ~ as.integer(as.logical(.)))) %>%
+    filter(!is.na(value)) %>%
+    drop_na(all_of(c("A01","A02","B08","B17"))) %>%
+    group_by(Outcome) %>%
+    group_modify(~{
+      this <- .x
+      geno_cols <- c("A01","A02","B08","B17")
+      keep <- geno_cols[vapply(this[geno_cols], function(v) dplyr::n_distinct(v) > 1, logical(1))]
+      if (length(keep) == 0) return(tibble())
+      fit <- try(stats::lm(stats::reformulate(keep, response = "value"), data = this), silent = TRUE)
+      if (inherits(fit, "try-error")) return(tibble())
+      coefs <- broom::tidy(fit, conf.int = TRUE) %>% dplyr::filter(.data$term %in% keep)
+      if (nrow(coefs) == 0) return(tibble())
+      dplyr::transmute(
+        coefs,
+        genotype = .data$term,
+        estimate = .data$estimate,
+        conf.low = .data$conf.low,
+        conf.high = .data$conf.high,
+        p.value = .data$p.value
+      )
+    }) %>%
+    ungroup() %>%
+    group_by(Outcome) %>%
+    mutate(
+      q.value = p.adjust(p.value, method = "BH"),
+      sig = dplyr::case_when(q.value < 0.001 ~ "***",
+                             q.value < 0.01  ~ "**",
+                             q.value < 0.05  ~ "*",
+                             TRUE            ~ ""),
+      .avg_abs = mean(abs(estimate), na.rm = TRUE)
+    ) %>%
+    ungroup() %>%
+    mutate(
+      Outcome = forcats::fct_reorder(Outcome, .avg_abs),
+      genotype = factor(genotype, levels = c("A01","A02","B08","B17")),
+      x_label = ifelse(conf.high >= 0, conf.high, conf.low)
+    ) %>%
+    mutate(
+      x_label = x_label + 0.02 * (max(conf.high, estimate, na.rm = TRUE) - min(conf.low, estimate, na.rm = TRUE))
+    ),
+  mapping = aes(x = estimate, y = Outcome, color = genotype)
+) +
+  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.6, color = "#9e9e9e") +
+  geom_errorbarh(
+    aes(xmin = conf.low, xmax = conf.high),
+    position = position_dodge(width = 0.6),
+    height = 0.12,
+    linewidth = 0.9,
+    alpha = 0.9
+  ) +
+  geom_point(
+    position = position_dodge(width = 0.6),
+    size = 2.6,
+    stroke = 0.6
+  ) +
+  geom_text(
+    aes(x = x_label, label = sig),
+    position = position_dodge(width = 0.6),
+    hjust = -0.1,
+    vjust = 0.5,
+    size = 3.5,
+    show.legend = FALSE
+  ) +
+  scale_color_brewer(palette = "Set1", drop = FALSE) +
+  labs(
+    title = "Genotype effects on outcome value",
+    x = "Effect size (β)",
+    y = "Outcome",
+    color = "Genotype"
+  ) +
+  coord_cartesian(clip = "off") +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", size = 15, hjust = 0.5),
+    plot.subtitle = element_text(size = 13),
+    axis.text = element_text(color = "#333333"),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_line(color = "#e2e2e2"),
+    legend.title = element_text(face = "bold"),
+    legend.key.width = unit(16, "pt"),
+    plot.margin = margin(8, 14, 8, 8, "pt")
+  )
+
+
+# --- 7) Combine --------------------------------------------------------------
+final_plot <- pA / pB + plot_layout(heights = c(3, 2)) +
+  plot_annotation(theme = theme(plot.margin = margin(5.5, 5.5, 5.5, 5.5)))
+
+print(final_plot)
+# ggsave("mhc_setpoints_genotype_panels.png", final_plot, width = 12, height = 8, dpi = 300)
+
+```
+
+
