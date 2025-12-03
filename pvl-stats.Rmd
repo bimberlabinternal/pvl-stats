@@ -226,7 +226,7 @@ Rdiscvr::SetLabKeyDefaults(baseUrl = 'https://prime-seq.ohsu.edu', defaultFolder
                  label = paste0("Rank ", setpoint_info$rank, " Setpoint (", 
                                setpoint_info$state_label, "): ",
                                round(setpoint_info$setpoint, 0), " copies/mL"),
-                 hjust = 0, vjust = -0.5, color = color, size = 3)
+                 hjust = 0, vjust = -0.5, color = color, size = 3, fontface="bold")
     }
   }
   
@@ -367,26 +367,38 @@ RunARTPipeline <- function(df, acute_window = 21) {
     computed_metrics$acute_burden <- auc
   }
   
-  # 3. On-ART Setpoint (entire on-ART period)
+  # 3. On-ART Setpoint and ART suppression (entire on-ART period)
   if (nrow(onart_df) >= 3) {
+    onart_df <- onart_df[order(onart_df$date, decreasing = FALSE), ]
     onart_setpoint <- exp(mean(log(onart_df$result)))
     
     # Get window dates for on-ART setpoint
     onart_setpoint_window_start <- min(onart_df$date, na.rm = TRUE)
     onart_setpoint_window_end <- max(onart_df$date, na.rm = TRUE)
     
+    # Get time to decline from acute phase peak
+    at_lod_rle <- rle(onart_df$result <= 1)
+    days_before_consecutive_LOD <- at_lod_rle$lengths[1:which.max(at_lod_rle$values) - 1] # get all samples before the day
+    first_dpi_at_consecutive_LOD <- onart_df[1, ]$timepostsivchallenge_dayspostinfection
+    days_before_LOD_cutoff <- onart_df[days_before_consecutive_LOD + 1, ]$timepostsivchallenge_dayspostinfection
+    if(!length(days_before_LOD_cutoff) == 0) {
+      first_dpi_at_consecutive_LOD <- days_before_LOD_cutoff
+    }
+    
     summary_outcomes <- append(summary_outcomes, list(
-      .AppendSummaryRow(id, date, "onArtSetpoint", numeric_value = onart_setpoint, data_source = data_source,
-                        window_start = onart_setpoint_window_start, window_end = onart_setpoint_window_end)
+      .AppendSummaryRow(id, date, "onArtSetpoint", numeric_value = onart_setpoint, data_source = data_source, window_start = onart_setpoint_window_start, window_end = onart_setpoint_window_end),
+      .AppendSummaryRow(id, date, "dpiToART_LOD", numeric_value = first_dpi_at_consecutive_LOD, data_source = data_source)
     ))
     
     computed_metrics$onart_setpoint <- onart_setpoint
+    computed_metrics$first_dpi_at_consecutive_LOD <- first_dpi_at_consecutive_LOD
   }
   
   # 4. On-ART Blip Frequency - improved detection
   # Use the lowest LOD value during on-ART period for consistent threshold
   lod_threshold <- min(onart_df$lod, na.rm = TRUE)
   onart_blips <- onart_df %>% 
+    filter(timepostsivchallenge_dayspostinfection >= computed_metrics$first_dpi_at_consecutive_LOD) %>%
     filter(!is.na(result), result > lod_threshold)  # Any value above LOD threshold
   blip_count <- nrow(onart_blips)
   
@@ -446,8 +458,13 @@ RunARTPipeline <- function(df, acute_window = 21) {
       computed_metrics$rebound_time_1000 <- list(time = rebound_time_1000, day = first_rebound_1000$dpi, value = first_rebound_1000$result)
     }
     
+    postrebound_peak_df <- postrebound_df %>% filter(dpi <= (art_end + 21))
+    peak_row <- postrebound_peak_df %>% filter(result == max(result, na.rm = TRUE)) %>% slice(1)
+    postrebound_peak <- peak_row$result
+    postrebound_day <- peak_row$dpi
+    
     # Post-rebound setpoint (14+ days after ART release)
-    postrebound_setpoint_df <- postrebound_df %>% filter(dpi > (art_end + 14))
+    postrebound_setpoint_df <- postrebound_df %>% filter(dpi > (art_end + 21))
     if (nrow(postrebound_setpoint_df) >= 3) {
       postrebound_setpoint <- exp(mean(log(postrebound_setpoint_df$result)))
       
@@ -456,10 +473,13 @@ RunARTPipeline <- function(df, acute_window = 21) {
       
       summary_outcomes <- append(summary_outcomes, list(
         .AppendSummaryRow(id, date, "postReboundSetpoint", numeric_value = postrebound_setpoint, data_source = data_source,
-                          window_start = postrebound_window_start, window_end = postrebound_window_end)
+                          window_start = postrebound_window_start, window_end = postrebound_window_end),
+        .AppendSummaryRow(id, date, "postReboundPeak_pVL", numeric_value = postrebound_peak, data_source = data_source),
+        .AppendSummaryRow(id, date, "postReboundPeak_day", numeric_value = postrebound_day, data_source = data_source)
       ))
       
       computed_metrics$postrebound_setpoint <- postrebound_setpoint
+      computed_metrics$postrebound_peak <- list(value = postrebound_peak, day = postrebound_day)
     }
   }
   
@@ -705,7 +725,7 @@ CreateUnifiedTimeSeriesPlot <- function(df, metrics, has_art = FALSE, skip_outco
   if (is.null(df) || nrow(df) == 0) {
     return(ggplot() + 
            theme_void() + 
-           annotate("text", x = 0.5, y = 0.5, label = "No Data Available", size = 6))
+           annotate("text", x = 0.5, y = 0.5, label = "No Data Available", size = 6, fontface="bold"))
   }
   
   df <- df %>% mutate(dpi = timepostsivchallenge_dayspostinfection)
@@ -739,15 +759,30 @@ CreateUnifiedTimeSeriesPlot <- function(df, metrics, has_art = FALSE, skip_outco
       gg <- gg + 
         geom_vline(xintercept = phases$art_start, linetype = "dashed", color = "blue", linewidth = 0.8) +
         annotate("text", x = phases$art_start, y = min(df$result[df$result > 0], na.rm = TRUE),
-                 label = "ART Initiation", angle = 90, vjust = 1.2, hjust = 0, color = "blue", size = 3.5)
+                 label = "ART Initiation", angle = 90, vjust = 1.2, hjust = 0, color = "blue", size = 3.5, fontface="bold")
     }
     
     # ART release line
     if (!is.na(phases$art_end)) {
       gg <- gg + 
-        geom_vline(xintercept = phases$art_end, linetype = "dashed", color = "red", linewidth = 0.8) +
+        geom_vline(xintercept = phases$art_end, linetype = "dashed", color = "darkred", linewidth = 0.8) +
         annotate("text", x = phases$art_end, y = min(df$result[df$result > 0], na.rm = TRUE),
-                 label = "ART Release", angle = 90, vjust = 1.2, hjust = 0, color = "red", size = 3.5)
+                 label = "ART Release", angle = 90, vjust = 1.2, hjust = 0, color = "darkred", size = 3.5, fontface="bold")
+    }
+    
+    if (!is.na(metrics$acute_burden)) {
+      gg <- gg + 
+        annotate("text", x = (phases$art_start / 2), y = (max(df$result) / (10^4)),
+                 label = paste0("Acute burden:\n", round(metrics$acute_burden, 0), " copies/mL * days"),
+                 vjust = -0.5, hjust = 0.5, color = "darkorange", size = 3.5, fontface="bold")
+    }
+    
+    # First time to LOD
+    if (!is.na(metrics$first_dpi_at_consecutive_LOD)) {
+      gg <- gg + 
+        geom_vline(xintercept = metrics$first_dpi_at_consecutive_LOD, linetype = "dashed", color = "darkgreen", linewidth = 0.8) +
+        annotate("text", x = metrics$first_dpi_at_consecutive_LOD, y = min(df$result[df$result > 0], na.rm = TRUE),
+                 label = "ART Suppression", angle = 90, vjust = 1.2, hjust = 0, color = "darkgreen", size = 3.5, fontface="bold")
     }
   }
   
@@ -757,31 +792,19 @@ CreateUnifiedTimeSeriesPlot <- function(df, metrics, has_art = FALSE, skip_outco
   if (has_art && !is.null(metrics$phases)) {
     phases <- metrics$phases
     
-    # Acute phase setpoint (from 0 to ART start only)
-    if (!is.null(metrics$acute_setpoint) && !is.na(phases$art_start)) {
-      gg <- gg +
-        annotate("text", x = phases$art_start/2, y = metrics$acute_setpoint,
-                 label = paste0("Acute setpoint:\n", round(metrics$acute_setpoint, 0), " copies/mL"),
-                 hjust = 0.5, vjust = -0.5, color = "orange", size = 3.2)
-    }
-    
-    # On-ART setpoint (from ART start to ART end or end of data)
-    if (!is.null(metrics$onart_setpoint)) {
-      art_end_x <- if (!is.na(phases$art_end)) phases$art_end else max(df$dpi, na.rm = TRUE)
-      gg <- gg +
-        annotate("text", x = (phases$art_start + art_end_x)/2, y = metrics$onart_setpoint,
-                 label = paste0("On-ART setpoint:\n", round(metrics$onart_setpoint, 0), " copies/mL"),
-                 hjust = 0.5, vjust = -0.5, color = "blue", size = 3.2)
-    }
-    
-    # Post-rebound setpoint (from ART end + 14 days to end of data)
+    # Post-rebound setpoint (from ART end + 21 days to end of data)
     if (!is.null(metrics$postrebound_setpoint) && !is.na(phases$art_end)) {
-      rebound_start <- phases$art_end + 14
+      rebound_start <- phases$art_end + 21
       if (rebound_start < max_x) {
         gg <- gg +
           annotate("text", x = (rebound_start + max_x)/2, y = metrics$postrebound_setpoint,
                    label = paste0("Post-rebound setpoint:\n", round(metrics$postrebound_setpoint, 0), " copies/mL"),
-                   hjust = 0.5, vjust = -0.5, color = "purple", size = 3.2)
+                   hjust = 0.5, vjust = -0.5, color = "purple", size = 3.2, fontface="bold")
+        
+        postrebound_data <- df %>% filter(dpi > (phases$art_end + 14)) %>% arrange(dpi)
+        gg <- gg +
+          geom_area(data = postrebound_data, aes(x = dpi, y = result), 
+                    fill = "purple", alpha = 0.08, inherit.aes = FALSE)
       }
     }
     
@@ -827,7 +850,7 @@ CreateUnifiedTimeSeriesPlot <- function(df, metrics, has_art = FALSE, skip_outco
             annotate("text", x = (acute_dpi_range$min_dpi + acute_dpi_range$max_dpi)/2, 
                      y = metrics$acute_setpoint,
                      label = paste0("Acute setpoint:\n", round(metrics$acute_setpoint, 0), " copies/mL"),
-                     hjust = 0.5, vjust = -0.5, color = "blue", size = 3.2)
+                     hjust = 0.5, vjust = -0.5, color = "blue", size = 3.2, fontface="bold")
         }
       }
       
@@ -841,7 +864,7 @@ CreateUnifiedTimeSeriesPlot <- function(df, metrics, has_art = FALSE, skip_outco
             annotate("text", x = (chronic_dpi_range$min_dpi + chronic_dpi_range$max_dpi)/2, 
                      y = metrics$chronic_setpoint,
                      label = paste0("Chronic setpoint:\n", round(metrics$chronic_setpoint, 0), " copies/mL"),
-                     hjust = 0.5, vjust = -0.5, color = "red", size = 3.2)
+                     hjust = 0.5, vjust = -0.5, color = "red", size = 3.2, fontface="bold")
         }
       }
       
@@ -852,7 +875,7 @@ CreateUnifiedTimeSeriesPlot <- function(df, metrics, has_art = FALSE, skip_outco
                      color = "purple", linewidth = 0.8, alpha = 0.7) +
           annotate("text", x = metrics$phase_boundary, y = min(df$result[df$result > 0], na.rm = TRUE),
                    label = "Acute→Chronic", angle = 90, vjust = 1.2, hjust = 0, 
-                   color = "purple", size = 3)
+                   color = "purple", size = 3, fontface="bold")
       }
     }
   }
@@ -861,30 +884,20 @@ CreateUnifiedTimeSeriesPlot <- function(df, metrics, has_art = FALSE, skip_outco
   if (!is.null(metrics$acute_peak)) {
     peak_color <- if (has_art) "darkorange" else "orange"
     gg <- gg +
-      geom_point(x = metrics$acute_peak$day, y = metrics$acute_peak$value,
-                 shape = 23, fill = peak_color, color = "black", size = 4) +
+      geom_point(aes(x = metrics$acute_peak$day, y = metrics$acute_peak$value),
+                 shape = 23, fill = "darkorange", color = "darkorange", size = 4) +
       annotate("text", x = metrics$acute_peak$day, y = metrics$acute_peak$value,
-               label = "Acute phase peak", vjust = -1.2, hjust = 0.5, size = 3.2, fontface = "bold")
+               label = "Acute phase peak", color = "darkorange", vjust = -1.2, hjust = 0.5, size = 3.2, fontface = "bold")
   }
   
-  # Add LOD rebound point for ART subjects (primary rebound marker)
-  if (has_art && !is.null(metrics$rebound_time_lod)) {
+  # Add 100 copies rebound point for ART subjects
+  if (has_art && !is.null(metrics$rebound_time_100)) {
     gg <- gg +
-      geom_point(x = metrics$rebound_time_lod$day, y = metrics$rebound_time_lod$value,
-                 shape = 21, fill = "darkgreen", color = "black", size = 3.5) +
-      annotate("text", x = metrics$rebound_time_lod$day, y = metrics$rebound_time_lod$value,
-               label = "Time to rebound\n(> LOD)", vjust = -0.5, hjust = 0.5, 
-               size = 2.8, color = "darkgreen")
-  }
-  
-  # Add 1000 copies rebound point for ART subjects (secondary marker)
-  if (has_art && !is.null(metrics$rebound_time_1000)) {
-    gg <- gg +
-      geom_point(x = metrics$rebound_time_1000$day, y = metrics$rebound_time_1000$value,
-                 shape = 21, fill = "red", color = "black", size = 3.5) +
-      annotate("text", x = metrics$rebound_time_1000$day, y = metrics$rebound_time_1000$value,
-               label = "Time to rebound\n(> 1000 copies)", vjust = -0.5, hjust = 0.5, 
-               size = 2.8, color = "red")
+      geom_point(aes(x = metrics$rebound_time_100$day, y = metrics$rebound_time_100$value),
+                 shape = 21, fill = "darkred", color = "darkred", size = 3.5) +
+      annotate("text", x = metrics$rebound_time_100$day, y = metrics$rebound_time_100$value,
+               label = "Time to rebound\n(> 100 copies)", vjust = -0.5, hjust = 0.5, 
+               size = 2.8, color = "darkred", fontface="bold")
   }
   
   # Add AUC shading for acute phase using stored original data
@@ -900,17 +913,26 @@ CreateUnifiedTimeSeriesPlot <- function(df, metrics, has_art = FALSE, skip_outco
     if (exists("acute_data") && nrow(acute_data) >= 2) {
       gg <- gg +
         geom_area(data = acute_data, aes(x = dpi, y = result), 
-                  fill = "lightblue", alpha = 0.3, inherit.aes = FALSE)
+                  fill = "orange", alpha = 0.09, inherit.aes = FALSE)
     }
   }
   
   # Add LOD line (only lowest LOD)
   min_lod <- min(df$lod, na.rm = TRUE)
   gg <- gg +
-    geom_hline(yintercept = min_lod, linetype = "dotted", color = "darkred", alpha = 0.7) +
+    geom_hline(yintercept = min_lod, linetype = "dotted", color = "black", alpha = 0.7) +
     annotate("text", x = max(df$dpi, na.rm = TRUE), y = min_lod,
              label = paste0("LOD (", min_lod, ")"), hjust = 1, vjust = -0.5, 
-             color = "darkred", size = 3)
+             color = "black", size = 3, fontface="bold")
+  
+  if (!is.null(metrics$postrebound_peak)) {
+    peak_color <- if (has_art) "purple" else "purple"
+    gg <- gg +
+      geom_point(aes(x = metrics$postrebound_peak$day, y = metrics$postrebound_peak$value),
+                 shape = 23, fill = "purple", color = "purple", size = 4) +
+      annotate("text", x = metrics$postrebound_peak$day, y = metrics$postrebound_peak$value,
+               label = "Post-rebound peak\n(first 3 weeks)", color = "purple", vjust = -1.2, hjust = 0.5, size = 3.2, fontface = "bold")
+  }
   
   return(gg)
 }
@@ -1067,6 +1089,7 @@ primeseq_res <- UploadPVLOutcomes(df)
 test_no_art <- Run(18769)  # Replace with an ID that has ART
 test_art <- Run(31443)  # Replace with an ID that doesn't have ART
 test <- Run(c(18769, 18821, 18898, 26537, 27307, 31262, 31443, 31883, 32388))
+Run(mhc_ids)
 # test_art$plots[["17062"]]
 # test_no_art$plots[["19309"]]
 
@@ -1169,4 +1192,6 @@ plots <- qq_points %>%
       ) +
       theme_minimal(base_size = 12)
   })
+
+test$plots
 ```
