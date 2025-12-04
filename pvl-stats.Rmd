@@ -304,6 +304,7 @@ RunARTPipeline <- function(df, acute_window = 21) {
 
   # Define phases
   art_start <- df %>% filter(!is.na(art_initiation_dpi)) %>% pull(art_initiation_dpi) %>% unique()
+  print(df)
   art_end <- df %>% filter(!is.na(art_release_dpi)) %>% pull(art_release_dpi) %>% unique()
   
   if (length(art_start) == 0) {
@@ -549,36 +550,35 @@ RunNoARTPipeline <- function(df) {
   
   # Process segmentation to get setpoints
   setpoint_analysis <- .ProcessSegmentationSetpoints(segmentation_result)
-  print(setpoint_analysis$plot)
   computed_metrics$segmentation <- setpoint_analysis
   computed_metrics$segmentation_raw <- segmentation_result
   
   # Extract setpoints
-  if (nrow(setpoint_analysis$setpoints) > 0) {
+  #if (nrow(setpoint_analysis$setpoints) > 0) {
     # Rank 1 setpoint (acute phase)
-    rank1_setpoint <- setpoint_analysis$setpoints %>% filter(rank == 1) %>% pull(setpoint)
-    if (length(rank1_setpoint) > 0) {
-      acute_window_start <- min(acute_df$date, na.rm = TRUE)
-      acute_window_end <- max(acute_df$date, na.rm = TRUE)
-      summary_outcomes <- append(summary_outcomes, list(
-        .AppendSummaryRow(id, date, "acutePhaseSetpoint", numeric_value = rank1_setpoint[1], data_source = data_source,
-                          window_start = acute_window_start, window_end = acute_window_end)
-      ))
-      computed_metrics$acute_setpoint <- rank1_setpoint[1]
-    }
+    #rank1_setpoint <- setpoint_analysis$setpoints %>% filter(rank == 1) %>% pull(setpoint)
+    #if (length(rank1_setpoint) > 0) {
+      #acute_window_start <- min(acute_df$date, na.rm = TRUE)
+      #acute_window_end <- max(acute_df$date, na.rm = TRUE)
+      #summary_outcomes <- append(summary_outcomes, list(
+      #  .AppendSummaryRow(id, date, "acutePhaseSetpoint", numeric_value = rank1_setpoint[1], data_source = data_source,
+      #                    window_start = acute_window_start, window_end = acute_window_end)
+      #))
+      #computed_metrics$acute_setpoint <- rank1_setpoint[1]
+    #}
     
     # Rank 2 setpoint (chronic/latent phase)
-    rank2_setpoint <- setpoint_analysis$setpoints %>% filter(rank == 2) %>% pull(setpoint)
-    if (length(rank2_setpoint) > 0) {
-      chronic_window_start <- min(chronic_df$date, na.rm = TRUE)
-      chronic_window_end <- max(chronic_df$date, na.rm = TRUE)
-      summary_outcomes <- append(summary_outcomes, list(
-        .AppendSummaryRow(id, date, "chronicPhaseSetpoint", numeric_value = rank2_setpoint[1], data_source = data_source,
-                          window_start = chronic_window_start, window_end = chronic_window_end)
-      ))
-      computed_metrics$chronic_setpoint <- rank2_setpoint[1]
-    }
-  }
+    #rank2_setpoint <- setpoint_analysis$setpoints %>% filter(rank == 2) %>% pull(setpoint)
+    #if (length(rank2_setpoint) > 0) {
+    #  chronic_window_start <- min(chronic_df$date, na.rm = TRUE)
+    #  chronic_window_end <- max(chronic_df$date, na.rm = TRUE)
+    #  summary_outcomes <- append(summary_outcomes, list(
+    #    .AppendSummaryRow(id, date, "chronicPhaseSetpoint", numeric_value = rank2_setpoint[1], data_source = data_source,
+    #                      window_start = chronic_window_start, window_end = chronic_window_end)
+    #  ))
+    #  computed_metrics$chronic_setpoint <- rank2_setpoint[1]
+    #}
+  #}
   
   # Map segmentation basins to original data points for phase assignment
   # Extract date ranges from segmentation basins and map to original real data
@@ -628,6 +628,17 @@ RunNoARTPipeline <- function(df) {
           chronic_df <- df %>% 
             filter(date >= chronic_date_range[1] & date <= chronic_date_range[2]) %>%
             arrange(timepostsivchallenge_dayspostinfection)
+        }
+        
+        rank2_setpoint <- setpoint_analysis$setpoints %>% filter(rank == 2) %>% pull(setpoint)
+        if (length(rank2_setpoint) > 0) {
+          chronic_window_start <- min(chronic_df$date, na.rm = TRUE)
+          chronic_window_end <- max(chronic_df$date, na.rm = TRUE)
+          summary_outcomes <- append(summary_outcomes, list(
+            .AppendSummaryRow(id, date, "chronicPhaseSetpoint", numeric_value = rank2_setpoint[1], data_source = data_source,
+                              window_start = chronic_window_start, window_end = chronic_window_end)
+          ))
+          computed_metrics$chronic_setpoint <- rank2_setpoint[1]
         }
         
         cat("Mapped to original data - Acute:", nrow(acute_df), "points, Chronic:", nrow(chronic_df), "points\n")
@@ -841,7 +852,7 @@ CreateUnifiedTimeSeriesPlot <- function(df, metrics, has_art = FALSE, skip_outco
       chronic_data <- metrics$chronic_phase_data
       
       # Acute phase setpoint line (span only acute phase region)
-      if (!is.null(metrics$acute_setpoint) && !is.null(acute_data) && nrow(acute_data) > 0) {
+      if (!is.null(metrics$acute_burden) && !is.null(acute_data) && nrow(acute_data) > 0) {
         acute_dpi_range <- acute_data %>% 
           summarise(min_dpi = min(dpi, na.rm = TRUE), max_dpi = max(dpi, na.rm = TRUE))
         
@@ -849,8 +860,8 @@ CreateUnifiedTimeSeriesPlot <- function(df, metrics, has_art = FALSE, skip_outco
           gg <- gg +
             annotate("text", x = (acute_dpi_range$min_dpi + acute_dpi_range$max_dpi)/2, 
                      y = metrics$acute_setpoint,
-                     label = paste0("Acute setpoint:\n", round(metrics$acute_setpoint, 0), " copies/mL"),
-                     hjust = 0.5, vjust = -0.5, color = "blue", size = 3.2, fontface="bold")
+                     label = paste0("Acute burden:\n", round(metrics$acute_burden, 0), " copies/mL * days"),
+                     hjust = 0.5, vjust = -0.5, color = "darkorange", size = 3.2, fontface="bold")
         }
       }
       
@@ -864,7 +875,10 @@ CreateUnifiedTimeSeriesPlot <- function(df, metrics, has_art = FALSE, skip_outco
             annotate("text", x = (chronic_dpi_range$min_dpi + chronic_dpi_range$max_dpi)/2, 
                      y = metrics$chronic_setpoint,
                      label = paste0("Chronic setpoint:\n", round(metrics$chronic_setpoint, 0), " copies/mL"),
-                     hjust = 0.5, vjust = -0.5, color = "red", size = 3.2, fontface="bold")
+                     hjust = 0.5, vjust = -0.5, color = "darkred", size = 3.2, fontface="bold")
+        gg <- gg +
+          geom_area(data = chronic_data, aes(x = dpi, y = result), 
+                    fill = "darkred", alpha = 0.08, inherit.aes = FALSE)
         }
       }
       
@@ -1086,7 +1100,7 @@ df <- RunAndSaveImages(ids = ids, folder_path = "pvl_figs_wide")
 primeseq_res <- UploadPVLOutcomes(df)
 
 # Test individual functions:
-test_no_art <- Run(18769)  # Replace with an ID that has ART
+test_no_art <- Run(18769)# Replace with an ID that has ART
 test_art <- Run(31443)  # Replace with an ID that doesn't have ART
 test <- Run(c(18769, 18821, 18898, 26537, 27307, 31262, 31443, 31883, 32388))
 Run(mhc_ids)
